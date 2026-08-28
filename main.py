@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 from dotenv import load_dotenv
 
@@ -47,31 +46,49 @@ def main():
 
     tokens = data["data"]["tokens"]
 
+    # Urutkan berdasarkan total PnL
+    tokens = sorted(
+        tokens,
+        key=lambda x: x.get("pnl", {}).get(
+            "total_usd", 0
+        ),
+        reverse=True
+    )
+
     print(
         "TOKEN_COUNT="
         + str(len(tokens))
     )
 
-    # Tampilkan struktur token pertama
-    if tokens:
+    print(
+        "TOKEN_RESULTS_START"
+    )
 
-        print(
-            "FIRST_TOKEN="
-            + json.dumps(
-                tokens[0],
-                separators=(",", ":")
-            )
+    for i, token in enumerate(tokens, start=1):
+
+        pnl = token.get("pnl", {})
+        counts = token.get("counts", {})
+        pricing = token.get("pricing", {})
+
+        result = (
+            f"{i}|"
+            f"{token.get('symbol')}|"
+            f"{token.get('address')}|"
+            f"BUY={counts.get('total_buy')}|"
+            f"SELL={counts.get('total_sell')}|"
+            f"TRADE={counts.get('total_trade')}|"
+            f"REALIZED=${pnl.get('realized_profit_usd')}|"
+            f"UNREALIZED=${pnl.get('unrealized_usd')}|"
+            f"TOTAL=${pnl.get('total_usd')}|"
+            f"ROI={pnl.get('total_percent')}%|"
+            f"AVG_BUY=${pricing.get('avg_buy_cost')}"
         )
 
-        print(
-            "TOKEN_KEYS="
-            + json.dumps(
-                list(tokens[0].keys()),
-                separators=(",", ":")
-            )
-        )
+        print(result)
 
-    print("TOKEN_ANALYSIS_READY")
+    print(
+        "TOKEN_RESULTS_END"
+    )
 
 
 if __name__ == "__main__":
