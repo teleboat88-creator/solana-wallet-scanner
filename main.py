@@ -1,24 +1,36 @@
 import os
 import time
+import json
 import requests
 from dotenv import load_dotenv
 
 # ============================================================
-# SMART MONEY WALLET ANALYZER V8
+# SMART MONEY WALLET MONITOR V9
+# SOLANA + BIRDEYE + TELEGRAM
 # ============================================================
 
 load_dotenv()
 
+# ============================================================
+# ENV
+# ============================================================
+
 API_KEY = os.getenv("BIRDEYE_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not API_KEY:
-    raise RuntimeError(
-        "BIRDEYE_API_KEY belum diatur"
-    )
+    raise RuntimeError("BIRDEYE_API_KEY belum diatur")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN belum diatur")
+
+if not TELEGRAM_CHAT_ID:
+    raise RuntimeError("TELEGRAM_CHAT_ID belum diatur")
 
 
 # ============================================================
-# CONFIG
+# WALLET
 # ============================================================
 
 WALLETS = [
@@ -32,6 +44,11 @@ WALLETS = [
     ),
 ]
 
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 BASE_URL = "https://public-api.birdeye.so"
 
 HEADERS = {
@@ -39,15 +56,39 @@ HEADERS = {
     "x-chain": "solana",
 }
 
-DURATION = "90d"
+# Jangan terlalu kecil.
+# Wallet API mempunyai rate limit khusus.
+POLL_INTERVAL = 20
 
 REQUEST_TIMEOUT = 30
 
-DELAY_BETWEEN_WALLETS = 10
+MAX_RETRIES = 4
+
+RETRY_BASE = 10
+
+# Berapa transaksi terakhir yang diminta
+TX_LIMIT = 20
+
+# Cache token
+TOKEN_CACHE_FILE = "token_cache.json"
+
+# Transaksi yang sudah pernah diproses
+SEEN_FILE = "seen_transactions.json"
+
+# Maksimal item cache
+MAX_SEEN = 500
 
 
 # ============================================================
-# HELPERS
+# MEMORY
+# ============================================================
+
+token_cache = {}
+seen_transactions = set()
+
+
+# ============================================================
+# BASIC HELPERS
 # ============================================================
 
 def num(value):
@@ -57,373 +98,581 @@ def num(value):
         return 0.0
 
 
-def pct(value):
-    """
-    Birdeye win_rate biasanya berbentuk decimal.
-    Contoh:
-    0.65 = 65%
-    """
-
-    value = num(value)
-
-    if value <= 1:
-        return value * 100
-
-    return value
-
-
-def money(value):
-    return f"${num(value):,.2f}"
-
-
 def safe_text(value, default="UNKNOWN"):
+
     if value is None:
         return default
 
     value = str(value).strip()
 
-    return value if value else default
+    if not value:
+        return default
+
+    return value
+
+
+def money(value):
+
+    return f"${num(value):,.2f}"
+
+
+def shorten(value, length=12):
+
+    value = safe_text(value, "")
+
+    if not value:
+        return ""
+
+    if len(value) <= length:
+        return value
+
+    return value[:length] + "..."
 
 
 # ============================================================
-# BIRDEYE API
+# CACHE
 # ============================================================
 
-def request_get(endpoint, params):
+def load_json_file(filename, default):
+
     try:
 
-        response = requests.get(
-            f"{BASE_URL}{endpoint}",
-            headers=HEADERS,
-            params=params,
-            timeout=REQUEST_TIMEOUT
+        if not os.path.exists(filename):
+            return default
+
+        with open(
+            filename,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            return json.load(f)
+
+    except Exception as e:
+
+        print(
+            f"CACHE READ ERROR {filename}: {e}"
         )
 
-        if response.status_code != 200:
+        return default
+
+
+def save_json_file(filename, data):
+
+    try:
+
+        with open(
+            filename,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as e:
+
+        print(
+            f"CACHE WRITE ERROR {filename}: {e}"
+        )
+
+
+def load_cache():
+
+    global token_cache
+    global seen_transactions
+
+    token_cache = load_json_file(
+        TOKEN_CACHE_FILE,
+        {}
+    )
+
+    seen = load_json_file(
+        SEEN_FILE,
+        []
+    )
+
+    if isinstance(seen, list):
+
+        seen_transactions = set(seen)
+
+    else:
+
+        seen_transactions = set()
+
+    print(
+        f"Token cache   : {len(token_cache)}"
+    )
+
+    print(
+        f"Seen tx cache  : {len(seen_transactions)}"
+    )
+
+
+def save_seen():
+
+    global seen_transactions
+
+    if len(seen_transactions) > MAX_SEEN:
+
+        seen_transactions = set(
+            list(seen_transactions)[-MAX_SEEN:]
+        )
+
+    save_json_file(
+        SEEN_FILE,
+        list(seen_transactions)
+    )
+
+
+# ============================================================
+# HTTP GET
+# ============================================================
+
+def api_get(endpoint, params=None):
+
+    for attempt in range(MAX_RETRIES):
+
+        try:
+
+            response = requests.get(
+                f"{BASE_URL}{endpoint}",
+                headers=HEADERS,
+                params=params or {},
+                timeout=REQUEST_TIMEOUT
+            )
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
+            if response.status_code == 200:
+
+                try:
+
+                    return response.json()
+
+                except ValueError:
+
+                    print(
+                        "INVALID JSON RESPONSE"
+                    )
+
+                    return None
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
+
+            if response.status_code == 429:
+
+                wait = RETRY_BASE * (
+                    2 ** attempt
+                )
+
+                print(
+                    f"429 RATE LIMIT | "
+                    f"retry {attempt + 1}/{MAX_RETRIES} | "
+                    f"wait {wait}s"
+                )
+
+                time.sleep(wait)
+
+                continue
+
+            # ------------------------------------------------
+            # AUTH
+            # ------------------------------------------------
+
+            if response.status_code in (
+                401,
+                403
+            ):
+
+                print(
+                    f"AUTH ERROR "
+                    f"{response.status_code}: "
+                    f"{response.text[:300]}"
+                )
+
+                return None
+
+            # ------------------------------------------------
+            # OTHER ERROR
+            # ------------------------------------------------
 
             print(
-                f"API ERROR {response.status_code}: "
-                f"{response.text[:500]}"
+                f"API ERROR "
+                f"{response.status_code}: "
+                f"{response.text[:300]}"
             )
 
             return None
 
-        return response.json()
+        except requests.RequestException as e:
 
-    except requests.RequestException as e:
+            wait = RETRY_BASE * (
+                2 ** attempt
+            )
 
-        print(
-            f"REQUEST ERROR: {e}"
-        )
+            print(
+                f"REQUEST ERROR: {e} | "
+                f"wait {wait}s"
+            )
 
-        return None
+            time.sleep(wait)
 
-    except ValueError as e:
+    print(
+        "API RETRY EXHAUSTED"
+    )
 
-        print(
-            f"JSON ERROR: {e}"
-        )
-
-        return None
+    return None
 
 
-def request_post(endpoint, payload):
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
+
+    url = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
+
     try:
 
         response = requests.post(
-            f"{BASE_URL}{endpoint}",
-            headers=HEADERS,
+            url,
             json=payload,
-            timeout=REQUEST_TIMEOUT
+            timeout=20
         )
 
         if response.status_code != 200:
 
             print(
-                f"API ERROR {response.status_code}: "
-                f"{response.text[:500]}"
+                "TELEGRAM ERROR:",
+                response.text[:500]
             )
 
-            return None
+            return False
 
-        return response.json()
+        return True
 
     except requests.RequestException as e:
 
         print(
-            f"REQUEST ERROR: {e}"
+            f"TELEGRAM REQUEST ERROR: {e}"
         )
 
-        return None
-
-    except ValueError as e:
-
-        print(
-            f"JSON ERROR: {e}"
-        )
-
-        return None
+        return False
 
 
 # ============================================================
-# WALLET SUMMARY
+# WALLET PNL
 # ============================================================
 
-def get_summary(wallet):
+def get_wallet_profile(wallet):
 
-    return request_get(
+    data = api_get(
         "/wallet/v2/pnl/summary",
         {
             "wallet": wallet,
-            "duration": DURATION,
+            "duration": "90d",
             "position_scope": "duration_only",
             "pnl_method": "net_cash",
         }
     )
 
+    if not data:
+        return None
+
+    return (
+        data.get("data", {})
+    )
+
 
 # ============================================================
-# WALLET DETAILS
+# WALLET TRANSACTIONS
 # ============================================================
 
-def get_details(wallet):
+def get_wallet_transactions(wallet):
 
-    return request_post(
-        "/wallet/v2/pnl/details",
+    return api_get(
+        "/v1/wallet/tx_list",
         {
             "wallet": wallet,
-            "duration": DURATION,
-            "position_scope": "duration_only",
-            "pnl_method": "net_cash",
-            "sort_by": "last_trade",
-            "sort_type": "desc",
-            "limit": 100,
-            "offset": 0,
+            "limit": TX_LIMIT,
+            "ui_amount_mode": "scaled",
         }
     )
 
 
 # ============================================================
-# EXTRACT DATA
+# TOKEN OVERVIEW
 # ============================================================
 
-def extract_summary(summary_data, details_data):
+def get_token_info(address):
 
-    summary = {}
+    if not address:
+        return None
 
-    if isinstance(summary_data, dict):
+    # Cache
+    if address in token_cache:
 
-        summary = (
-            summary_data
-            .get("data", {})
-        )
+        return token_cache[address]
 
-    if not summary:
+    data = api_get(
+        "/defi/token_overview",
+        {
+            "address": address,
+            "frames": "1m,5m,1h,24h",
+            "ui_amount_mode": "scaled",
+        }
+    )
 
-        summary = (
-            details_data
-            .get("data", {})
-            .get("summary", {})
-        )
+    if not data:
 
-    if not isinstance(summary, dict):
+        return None
 
-        summary = {}
-
-    return summary
-
-
-def extract_tokens(details_data):
-
-    if not isinstance(details_data, dict):
-
-        return []
-
-    data = details_data.get(
+    info = data.get(
         "data",
         {}
     )
 
-    tokens = data.get(
-        "tokens",
-        []
+    if not isinstance(info, dict):
+
+        return None
+
+    token_cache[address] = info
+
+    save_json_file(
+        TOKEN_CACHE_FILE,
+        token_cache
     )
 
-    if not isinstance(tokens, list):
-
-        return []
-
-    return tokens
+    return info
 
 
 # ============================================================
-# TOKEN ANALYSIS
+# TOKEN ADDRESS EXTRACTION
 # ============================================================
 
-def analyze_tokens(tokens):
+def find_token_addresses(obj):
 
-    result = {
-        "total": 0,
-        "profitable": 0,
-        "losing": 0,
-        "open_profit": 0,
-        "open_loss": 0,
-        "best": None,
-        "worst": None,
-    }
+    addresses = []
 
-    if not tokens:
+    def walk(value):
 
-        return result
+        if isinstance(value, dict):
 
-    result["total"] = len(tokens)
+            for key, item in value.items():
 
-    ranked = []
+                key_lower = str(key).lower()
 
-    for token in tokens:
-
-        pnl = token.get(
-            "pnl",
-            {}
-        )
-
-        total_usd = num(
-            pnl.get("total_usd")
-        )
-
-        realized = num(
-            pnl.get("realized_profit_usd")
-        )
-
-        unrealized = num(
-            pnl.get("unrealized_usd")
-        )
-
-        total_percent = num(
-            pnl.get("total_percent")
-        )
-
-        symbol = safe_text(
-            token.get("symbol")
-        )
-
-        address = safe_text(
-            token.get(
-                "address",
-                token.get(
+                if key_lower in (
+                    "address",
                     "token_address",
-                    ""
-                )
-            ),
-            ""
-        )
+                    "mint",
+                    "token_mint",
+                    "token_address"
+                ):
 
-        item = {
-            "symbol": symbol,
-            "address": address,
-            "total_usd": total_usd,
-            "realized": realized,
-            "unrealized": unrealized,
-            "percent": total_percent,
-        }
+                    if isinstance(item, str):
 
-        ranked.append(item)
+                        if len(item) >= 32:
 
-        if total_usd > 0:
+                            addresses.append(item)
 
-            result["profitable"] += 1
+                walk(item)
 
-        elif total_usd < 0:
+        elif isinstance(value, list):
 
-            result["losing"] += 1
+            for item in value:
 
-        if unrealized > 0:
+                walk(item)
 
-            result["open_profit"] += 1
+    walk(obj)
 
-        elif unrealized < 0:
+    # remove duplicates
+    result = []
 
-            result["open_loss"] += 1
+    for address in addresses:
 
-    ranked.sort(
-        key=lambda x: x["total_usd"],
-        reverse=True
-    )
+        if address not in result:
 
-    if ranked:
-
-        result["best"] = ranked[0]
-
-        result["worst"] = ranked[-1]
-
-    result["ranked"] = ranked
+            result.append(address)
 
     return result
 
 
 # ============================================================
-# SMART SCORE V8
+# BUY DETECTION
 # ============================================================
 
-def score_wallet(summary, token_analysis):
+def text_contains_buy(obj):
 
-    counts = summary.get(
+    found = False
+
+    def walk(value):
+
+        nonlocal found
+
+        if found:
+            return
+
+        if isinstance(value, dict):
+
+            for key, item in value.items():
+
+                key_lower = str(key).lower()
+
+                # Explicit side/type/action
+                if key_lower in (
+                    "side",
+                    "type",
+                    "action",
+                    "tx_type",
+                    "trade_type",
+                    "event_type"
+                ):
+
+                    text = str(item).lower()
+
+                    if text in (
+                        "buy",
+                        "bought",
+                        "swap_buy"
+                    ):
+
+                        found = True
+                        return
+
+                walk(item)
+
+        elif isinstance(value, list):
+
+            for item in value:
+
+                walk(item)
+
+        elif isinstance(value, str):
+
+            text = value.lower()
+
+            if text in (
+                "buy",
+                "bought"
+            ):
+
+                found = True
+
+    walk(obj)
+
+    return found
+
+
+# ============================================================
+# TRANSACTION ID
+# ============================================================
+
+def get_transaction_id(tx):
+
+    if not isinstance(tx, dict):
+
+        return None
+
+    for key in (
+        "txHash",
+        "tx_hash",
+        "signature",
+        "transactionHash",
+        "hash"
+    ):
+
+        value = tx.get(key)
+
+        if value:
+
+            return str(value)
+
+    return None
+
+
+# ============================================================
+# TRANSACTION TIME
+# ============================================================
+
+def get_transaction_time(tx):
+
+    if not isinstance(tx, dict):
+
+        return ""
+
+    for key in (
+        "blockTime",
+        "block_time",
+        "timestamp",
+        "time",
+        "unixTime"
+    ):
+
+        value = tx.get(key)
+
+        if value:
+
+            return str(value)
+
+    return ""
+
+
+# ============================================================
+# SCORE WALLET
+# ============================================================
+
+def calculate_wallet_score(profile):
+
+    if not profile:
+
+        return {
+            "score": 0,
+            "status": "UNKNOWN",
+            "win_rate": 0,
+            "realized": 0,
+            "trades": 0,
+        }
+
+    counts = profile.get(
         "counts",
         {}
     )
 
-    pnl = summary.get(
+    pnl = profile.get(
         "pnl",
         {}
-    )
-
-    # --------------------------------------------------------
-    # TRADING ACTIVITY
-    # --------------------------------------------------------
-
-    buys = num(
-        counts.get("total_buy")
-    )
-
-    sells = num(
-        counts.get("total_sell")
     )
 
     trades = num(
         counts.get("total_trade")
     )
 
-    # fallback
-    if trades <= 0:
-
-        trades = buys + sells
-
-    # --------------------------------------------------------
-    # WIN RATE
-    # --------------------------------------------------------
-
-    win_rate = pct(
+    win_rate = num(
         counts.get("win_rate")
     )
 
-    if win_rate >= 70:
-        win_score = 25
+    if win_rate <= 1:
 
-    elif win_rate >= 60:
-        win_score = 22
-
-    elif win_rate >= 50:
-        win_score = 18
-
-    elif win_rate >= 40:
-        win_score = 12
-
-    else:
-        win_score = 5
-
-    # --------------------------------------------------------
-    # REALIZED PNL
-    # --------------------------------------------------------
+        win_rate *= 100
 
     realized = num(
         pnl.get(
@@ -431,185 +680,68 @@ def score_wallet(summary, token_analysis):
         )
     )
 
+    score = 0
+
+    # Win rate 30
+    if win_rate >= 70:
+        score += 30
+
+    elif win_rate >= 60:
+        score += 25
+
+    elif win_rate >= 50:
+        score += 20
+
+    elif win_rate >= 40:
+        score += 12
+
+    else:
+        score += 5
+
+    # Realized PnL 30
     if realized >= 50000:
-        realized_score = 25
+        score += 30
 
     elif realized >= 25000:
-        realized_score = 22
+        score += 27
 
     elif realized >= 10000:
-        realized_score = 18
+        score += 23
 
     elif realized > 0:
-        realized_score = 12
+        score += 15
 
-    else:
-        realized_score = 0
-
-    # --------------------------------------------------------
-    # EXPERIENCE
-    # --------------------------------------------------------
-
+    # Experience 20
     if trades >= 500:
-        trade_score = 15
+        score += 20
 
     elif trades >= 200:
-        trade_score = 13
+        score += 17
 
     elif trades >= 100:
-        trade_score = 11
+        score += 14
 
     elif trades >= 50:
-        trade_score = 8
+        score += 10
 
     else:
-        trade_score = 4
+        score += 5
 
-    # --------------------------------------------------------
-    # PROFITABLE TOKENS
-    # --------------------------------------------------------
+    # Positive realized bonus
+    if realized > 0:
 
-    profitable = token_analysis["profitable"]
+        score += 10
 
-    if profitable >= 10:
-        diversity_score = 15
-
-    elif profitable >= 5:
-        diversity_score = 13
-
-    elif profitable >= 3:
-        diversity_score = 11
-
-    elif profitable >= 2:
-        diversity_score = 8
-
-    elif profitable >= 1:
-        diversity_score = 5
-
-    else:
-        diversity_score = 0
-
-    # --------------------------------------------------------
-    # REALIZED VS UNREALIZED RISK
-    # --------------------------------------------------------
-
-    unrealized = num(
-        pnl.get(
-            "unrealized_usd"
-        )
-    )
-
-    total = num(
-        pnl.get(
-            "total_usd"
-        )
-    )
-
-    if total > 0:
-
-        ratio = max(
-            unrealized,
-            0
-        ) / total
-
-    else:
-
-        ratio = 1.0
-
-    if ratio < 0.30:
-
-        risk_score = 20
-
-    elif ratio < 0.50:
-
-        risk_score = 16
-
-    elif ratio < 0.70:
-
-        risk_score = 12
-
-    elif ratio < 0.85:
-
-        risk_score = 7
-
-    else:
-
-        risk_score = 3
-
-    # --------------------------------------------------------
-    # BUY / SELL BALANCE
-    # --------------------------------------------------------
-
-    if buys > 0:
-
-        sell_ratio = sells / buys
-
-    else:
-
-        sell_ratio = 0
-
-    if 0.30 <= sell_ratio <= 1.50:
-
-        execution_score = 10
-
-    elif sell_ratio > 0:
-
-        execution_score = 6
-
-    else:
-
-        execution_score = 2
-
-    # --------------------------------------------------------
-    # TOTAL
-    # --------------------------------------------------------
-
-    raw_total = (
-        win_score
-        + realized_score
-        + trade_score
-        + diversity_score
-        + risk_score
-    )
-
-    # V8 uses execution as secondary modifier
-    # to avoid changing the original 100-point model.
-
-    if execution_score >= 10:
-
-        final_score = min(
-            100,
-            raw_total + 2
-        )
-
-    elif execution_score <= 2:
-
-        final_score = max(
-            0,
-            raw_total - 2
-        )
-
-    else:
-
-        final_score = raw_total
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    if final_score >= 80:
+    # Status
+    if score >= 80:
 
         status = "CORE"
 
-    elif final_score >= 70:
-
-        status = "STRONG WATCH"
-
-    elif final_score >= 65:
+    elif score >= 65:
 
         status = "WATCH"
 
-    elif final_score >= 50:
+    elif score >= 50:
 
         status = "WEAK"
 
@@ -618,387 +750,306 @@ def score_wallet(summary, token_analysis):
         status = "REJECT"
 
     return {
-        "total": final_score,
-        "win": win_score,
-        "realized": realized_score,
-        "experience": trade_score,
-        "diversity": diversity_score,
-        "risk": risk_score,
-        "execution": execution_score,
+        "score": min(score, 100),
         "status": status,
-        "buys": buys,
-        "sells": sells,
-        "trades": trades,
         "win_rate": win_rate,
-        "realized_usd": realized,
+        "realized": realized,
+        "trades": trades,
     }
 
 
 # ============================================================
-# WALLET ANALYSIS
+# BUILD ALERT
 # ============================================================
 
-def analyze(name, wallet):
+def build_alert(
+    wallet_name,
+    wallet,
+    token_address,
+    token_info,
+    profile,
+    tx
+):
 
-    print()
-    print("=" * 70)
-    print(f"SMART MONEY V8 | {name}")
-    print(wallet)
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # GET DATA
-    # --------------------------------------------------------
-
-    summary_data = get_summary(
-        wallet
+    wallet_score = calculate_wallet_score(
+        profile
     )
 
-    if not summary_data:
+    symbol = safe_text(
+        token_info.get("symbol")
+        if token_info
+        else None
+    )
 
-        print(
-            "Gagal mengambil wallet summary."
+    name = safe_text(
+        token_info.get("name")
+        if token_info
+        else None
+    )
+
+    price = num(
+        token_info.get("price")
+        if token_info
+        else 0
+    )
+
+    liquidity = num(
+        token_info.get("liquidity")
+        if token_info
+        else 0
+    )
+
+    market_cap = num(
+        token_info.get("mc")
+        if token_info
+        else 0
+    )
+
+    holder = num(
+        token_info.get("holder")
+        if token_info
+        else 0
+    )
+
+    buy_24h = num(
+        token_info.get("buy24h")
+        if token_info
+        else 0
+    )
+
+    sell_24h = num(
+        token_info.get("sell24h")
+        if token_info
+        else 0
+    )
+
+    change_24h = num(
+        token_info.get("priceChange24hPercent")
+        if token_info
+        else 0
+    )
+
+    tx_id = get_transaction_id(
+        tx
+    )
+
+    signal = "WATCH"
+
+    if wallet_score["score"] >= 80:
+
+        signal = "HIGH QUALITY SMART MONEY"
+
+    elif wallet_score["score"] >= 65:
+
+        signal = "SMART MONEY WATCH"
+
+    message = (
+        "🚨 SMART MONEY BUY\n"
+        "\n"
+        f"🟢 Wallet: {wallet_name}\n"
+        f"📊 Score: {wallet_score['score']}/100\n"
+        f"🏆 Status: {wallet_score['status']}\n"
+        "\n"
+        f"🪙 Token: {symbol}\n"
+        f"📛 Name: {name}\n"
+        f"📍 Mint: {token_address}\n"
+        "\n"
+        f"💰 Price: {money(price)}\n"
+        f"💧 Liquidity: {money(liquidity)}\n"
+        f"🏦 Market Cap: {money(market_cap)}\n"
+        f"👥 Holders: {int(holder):,}\n"
+        "\n"
+        f"🟢 24H BUY: {int(buy_24h):,}\n"
+        f"🔴 24H SELL: {int(sell_24h):,}\n"
+        f"📈 24H Change: {change_24h:.2f}%\n"
+        "\n"
+        f"📈 Win Rate: {wallet_score['win_rate']:.2f}%\n"
+        f"💵 Realized PnL: {money(wallet_score['realized'])}\n"
+        f"🔄 Trades: {int(wallet_score['trades']):,}\n"
+        "\n"
+        f"🔥 SIGNAL: {signal}\n"
+    )
+
+    if tx_id:
+
+        message += (
+            "\n"
+            f"🔗 TX: {shorten(tx_id, 20)}"
         )
 
-        return None
-
-    details_data = get_details(
-        wallet
+    message += (
+        "\n\n"
+        "⚠️ DYOR — bukan nasihat keuangan."
     )
 
-    if not details_data:
+    return message
+
+
+# ============================================================
+# PROCESS TRANSACTION
+# ============================================================
+
+def process_transaction(
+    wallet_name,
+    wallet,
+    tx,
+    profile
+):
+
+    tx_id = get_transaction_id(
+        tx
+    )
+
+    if not tx_id:
+
+        return
+
+    # Sudah pernah diproses
+    if tx_id in seen_transactions:
+
+        return
+
+    # Tandai terlebih dahulu agar
+    # tidak double alert
+    seen_transactions.add(
+        tx_id
+    )
+
+    # Jangan langsung save setiap tx
+    # supaya disk tidak terlalu sering ditulis.
+
+    # --------------------------------------------------------
+    # BUY DETECTION
+    # --------------------------------------------------------
+
+    if not text_contains_buy(tx):
+
+        return
+
+    print()
+    print(
+        "=========================================="
+    )
+
+    print(
+        "🔥 BUY DETECTED"
+    )
+
+    print(
+        f"Wallet : {wallet_name}"
+    )
+
+    print(
+        f"TX     : {tx_id}"
+    )
+
+    # --------------------------------------------------------
+    # FIND TOKEN
+    # --------------------------------------------------------
+
+    addresses = find_token_addresses(
+        tx
+    )
+
+    if not addresses:
 
         print(
-            "Gagal mengambil wallet details."
+            "Token address tidak ditemukan."
         )
 
-        return None
+        return
 
-    # --------------------------------------------------------
-    # EXTRACT
-    # --------------------------------------------------------
+    # Ambil kandidat token pertama.
+    # Pada swap kompleks bisa ada beberapa address.
+    token_address = addresses[0]
 
-    summary = extract_summary(
-        summary_data,
-        details_data
+    print(
+        f"Token  : {token_address}"
     )
 
-    tokens = extract_tokens(
-        details_data
+    # --------------------------------------------------------
+    # TOKEN INFO
+    # --------------------------------------------------------
+
+    token_info = get_token_info(
+        token_address
     )
 
-    if not summary:
+    if token_info:
 
         print(
-            "Summary kosong."
+            f"Symbol : "
+            f"{token_info.get('symbol', 'UNKNOWN')}"
         )
-
-        return None
-
-    # --------------------------------------------------------
-    # ANALYSIS
-    # --------------------------------------------------------
-
-    token_analysis = analyze_tokens(
-        tokens
-    )
-
-    score = score_wallet(
-        summary,
-        token_analysis
-    )
-
-    counts = summary.get(
-        "counts",
-        {}
-    )
-
-    pnl = summary.get(
-        "pnl",
-        {}
-    )
-
-    cashflow = summary.get(
-        "cashflow_usd",
-        {}
-    )
-
-    # --------------------------------------------------------
-    # BASIC STATS
-    # --------------------------------------------------------
-
-    print()
-    print("WALLET STATISTICS")
-    print("------------------")
-
-    print(
-        f"BUY         : "
-        f"{counts.get('total_buy', 0)}"
-    )
-
-    print(
-        f"SELL        : "
-        f"{counts.get('total_sell', 0)}"
-    )
-
-    print(
-        f"TRADE       : "
-        f"{counts.get('total_trade', 0)}"
-    )
-
-    print(
-        f"WIN RATE    : "
-        f"{score['win_rate']:.2f}%"
-    )
-
-    print(
-        f"WIN         : "
-        f"{counts.get('total_win', 0)}"
-    )
-
-    print(
-        f"LOSS        : "
-        f"{counts.get('total_loss', 0)}"
-    )
-
-    print(
-        f"TOKENS      : "
-        f"{len(tokens)}"
-    )
-
-    # --------------------------------------------------------
-    # PNL
-    # --------------------------------------------------------
-
-    print()
-    print("PNL")
-    print("---")
-
-    print(
-        f"Invested    : "
-        f"{money(cashflow.get('total_invested'))}"
-    )
-
-    print(
-        f"Sold        : "
-        f"{money(cashflow.get('total_sold'))}"
-    )
-
-    print(
-        f"Current     : "
-        f"{money(cashflow.get('current_value'))}"
-    )
-
-    print(
-        f"Realized    : "
-        f"{money(pnl.get('realized_profit_usd'))}"
-    )
-
-    print(
-        f"Unrealized  : "
-        f"{money(pnl.get('unrealized_usd'))}"
-    )
-
-    print(
-        f"Total PnL   : "
-        f"{money(pnl.get('total_usd'))}"
-    )
-
-    print(
-        f"Avg Trade   : "
-        f"{money(pnl.get('avg_profit_per_trade_usd'))}"
-    )
-
-    # --------------------------------------------------------
-    # SMART SCORE
-    # --------------------------------------------------------
-
-    print()
-    print("SMART SCORE V8")
-    print("--------------")
-
-    print(
-        f"TOTAL          : "
-        f"{score['total']}/100"
-    )
-
-    print(
-        f"Win Rate       : "
-        f"{score['win']}/25"
-    )
-
-    print(
-        f"Realized PnL   : "
-        f"{score['realized']}/25"
-    )
-
-    print(
-        f"Experience     : "
-        f"{score['experience']}/15"
-    )
-
-    print(
-        f"Diversification: "
-        f"{score['diversity']}/15"
-    )
-
-    print(
-        f"Risk           : "
-        f"{score['risk']}/20"
-    )
-
-    print(
-        f"Execution      : "
-        f"{score['execution']}/10"
-    )
-
-    print(
-        f"STATUS         : "
-        f"{score['status']}"
-    )
-
-    # --------------------------------------------------------
-    # TOKEN QUALITY
-    # --------------------------------------------------------
-
-    print()
-    print("TOKEN QUALITY")
-    print("-------------")
-
-    print(
-        f"Profitable : "
-        f"{token_analysis['profitable']}"
-    )
-
-    print(
-        f"Losing     : "
-        f"{token_analysis['losing']}"
-    )
-
-    print(
-        f"Open Profit: "
-        f"{token_analysis['open_profit']}"
-    )
-
-    print(
-        f"Open Loss  : "
-        f"{token_analysis['open_loss']}"
-    )
-
-    # --------------------------------------------------------
-    # BEST TOKEN
-    # --------------------------------------------------------
-
-    best = token_analysis.get(
-        "best"
-    )
-
-    if best:
-
-        print()
-        print("BEST TOKEN")
-        print("----------")
-
-        print(
-            f"{best['symbol']} | "
-            f"PnL={money(best['total_usd'])} | "
-            f"ROI={best['percent']:.2f}%"
-        )
-
-    # --------------------------------------------------------
-    # WORST TOKEN
-    # --------------------------------------------------------
-
-    worst = token_analysis.get(
-        "worst"
-    )
-
-    if worst:
-
-        print()
-        print("WORST TOKEN")
-        print("-----------")
-
-        print(
-            f"{worst['symbol']} | "
-            f"PnL={money(worst['total_usd'])} | "
-            f"ROI={worst['percent']:.2f}%"
-        )
-
-    # --------------------------------------------------------
-    # TOP TOKENS
-    # --------------------------------------------------------
-
-    print()
-    print("TOP 10 TOKENS")
-    print("-------------")
-
-    ranked = token_analysis.get(
-        "ranked",
-        []
-    )
-
-    for i, token in enumerate(
-        ranked[:10],
-        1
-    ):
-
-        print(
-            f"{i:02d}. "
-            f"{token['symbol']:<15} "
-            f"PnL={money(token['total_usd']):>15} | "
-            f"ROI={token['percent']:>8.2f}%"
-        )
-
-    # --------------------------------------------------------
-    # INVESTMENT SIGNAL
-    # --------------------------------------------------------
-
-    print()
-    print("V8 SIGNAL")
-    print("---------")
-
-    if (
-        score["total"] >= 80
-        and score["win_rate"] >= 60
-        and score["realized_usd"] > 0
-        and token_analysis["profitable"] >= 3
-    ):
-
-        signal = "🟢 HIGH QUALITY SMART MONEY"
-
-    elif (
-        score["total"] >= 70
-        and score["win_rate"] >= 50
-        and score["realized_usd"] > 0
-    ):
-
-        signal = "🟡 SMART MONEY WATCH"
-
-    elif score["total"] >= 60:
-
-        signal = "🟠 NEED MORE DATA"
 
     else:
 
-        signal = "🔴 LOW QUALITY"
+        print(
+            "Token overview gagal."
+        )
 
-    print(signal)
+        token_info = {}
+
+    # --------------------------------------------------------
+    # BUILD ALERT
+    # --------------------------------------------------------
+
+    alert = build_alert(
+        wallet_name,
+        wallet,
+        token_address,
+        token_info,
+        profile,
+        tx
+    )
 
     print()
-    print("-" * 70)
+    print(alert)
 
-    return {
-        "name": name,
-        "wallet": wallet,
-        "score": score,
-        "tokens": token_analysis,
-        "summary": summary,
-    }
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    sent = send_telegram(
+        alert
+    )
+
+    if sent:
+
+        print(
+            "✅ Telegram alert sent."
+        )
+
+    else:
+
+        print(
+            "❌ Telegram alert failed."
+        )
 
 
 # ============================================================
-# MAIN
+# WELCOME
+# ============================================================
+
+def send_start_message():
+
+    message = (
+        "🤖 SMART MONEY MONITOR V9\n"
+        "\n"
+        "Status: ONLINE 🟢\n"
+        f"Wallet monitored: {len(WALLETS)}\n"
+        f"Poll interval: {POLL_INTERVAL}s\n"
+        "\n"
+        "Bot sedang memonitor transaksi BUY."
+    )
+
+    send_telegram(
+        message
+    )
+
+
+# ============================================================
+# MAIN MONITOR
 # ============================================================
 
 def main():
@@ -1009,7 +1060,7 @@ def main():
     )
 
     print(
-        "      SMART MONEY WALLET ANALYZER V8"
+        "       SMART MONEY WALLET MONITOR V9"
     )
 
     print(
@@ -1017,123 +1068,308 @@ def main():
     )
 
     print(
-        f"Duration : {DURATION}"
+        f"Wallets       : {len(WALLETS)}"
     )
 
     print(
-        f"Wallets  : {len(WALLETS)}"
+        f"Poll interval : {POLL_INTERVAL}s"
     )
 
-    results = []
+    print(
+        f"TX limit      : {TX_LIMIT}"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    load_cache()
 
     # --------------------------------------------------------
-    # ANALYZE ALL WALLETS
+    # WALLET PROFILES
     # --------------------------------------------------------
 
-    for index, (name, wallet) in enumerate(
-        WALLETS
-    ):
+    profiles = {}
 
-        result = analyze(
-            name,
+    print()
+    print(
+        "Loading wallet profiles..."
+    )
+
+    for index, (
+        wallet_name,
+        wallet
+    ) in enumerate(WALLETS):
+
+        print()
+        print(
+            f"Profile: {wallet_name}"
+        )
+
+        profile = get_wallet_profile(
             wallet
         )
 
-        if result:
+        profiles[wallet] = profile
 
-            results.append(
-                result
+        if profile:
+
+            score = calculate_wallet_score(
+                profile
+            )
+
+            print(
+                f"Score     : "
+                f"{score['score']}/100"
+            )
+
+            print(
+                f"Win Rate  : "
+                f"{score['win_rate']:.2f}%"
+            )
+
+            print(
+                f"Realized  : "
+                f"{money(score['realized'])}"
+            )
+
+            print(
+                f"Trades    : "
+                f"{int(score['trades'])}"
+            )
+
+            print(
+                f"Status    : "
+                f"{score['status']}"
+            )
+
+        else:
+
+            print(
+                "Profile gagal diambil."
             )
 
         if index < len(WALLETS) - 1:
 
-            print()
-            print(
-                f"Waiting "
-                f"{DELAY_BETWEEN_WALLETS} seconds..."
-            )
-
             time.sleep(
-                DELAY_BETWEEN_WALLETS
+                5
             )
 
     # --------------------------------------------------------
-    # FINAL COMPARISON
+    # TELEGRAM ONLINE
+    # --------------------------------------------------------
+
+    send_start_message()
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # INITIAL SNAPSHOT IS MARKED AS SEEN
+    # sehingga bot tidak mengirim semua transaksi lama
+    # ketika pertama kali start.
     # --------------------------------------------------------
 
     print()
-    print()
     print(
-        "=============================================="
+        "Creating initial transaction snapshot..."
     )
 
-    print(
-        "              V8 FINAL RANKING"
-    )
+    for wallet_name, wallet in WALLETS:
 
-    print(
-        "=============================================="
-    )
-
-    ranked_wallets = sorted(
-        results,
-        key=lambda x: x["score"]["total"],
-        reverse=True
-    )
-
-    for index, result in enumerate(
-        ranked_wallets,
-        1
-    ):
-
-        score = result["score"]
-
-        print(
-            f"{index}. "
-            f"{result['name']} | "
-            f"SCORE={score['total']}/100 | "
-            f"WR={score['win_rate']:.1f}% | "
-            f"BUY={int(score['buys'])} | "
-            f"SELL={int(score['sells'])} | "
-            f"{score['status']}"
+        data = get_wallet_transactions(
+            wallet
         )
 
-    # --------------------------------------------------------
-    # WINNER
-    # --------------------------------------------------------
+        if not data:
 
-    if ranked_wallets:
+            continue
 
-        winner = ranked_wallets[0]
+        transactions = (
+            data
+            .get("data", {})
+            .get("solana", [])
+        )
+
+        if not transactions:
+
+            transactions = (
+                data
+                .get("data", {})
+                .get("items", [])
+            )
+
+        if isinstance(
+            transactions,
+            list
+        ):
+
+            for tx in transactions:
+
+                tx_id = get_transaction_id(
+                    tx
+                )
+
+                if tx_id:
+
+                    seen_transactions.add(
+                        tx_id
+                    )
+
+        time.sleep(
+            3
+        )
+
+    save_seen()
+
+    print()
+    print(
+        f"Initial snapshot: "
+        f"{len(seen_transactions)} tx"
+    )
+
+    print()
+    print(
+        "=============================================="
+    )
+
+    print(
+        "MONITORING ACTIVE 🟢"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    # ========================================================
+    # CONTINUOUS MONITOR
+    # ========================================================
+
+    cycle = 0
+
+    while True:
+
+        cycle += 1
 
         print()
         print(
-            "V8 BEST WALLET"
+            f"[CYCLE {cycle}] "
+            f"Checking wallets..."
         )
 
+        for wallet_name, wallet in WALLETS:
+
+            print()
+            print(
+                f"Checking "
+                f"{wallet_name}"
+            )
+
+            data = get_wallet_transactions(
+                wallet
+            )
+
+            if not data:
+
+                print(
+                    "No transaction data."
+                )
+
+                continue
+
+            transactions = (
+                data
+                .get("data", {})
+                .get("solana", [])
+            )
+
+            if not transactions:
+
+                transactions = (
+                    data
+                    .get("data", {})
+                    .get("items", [])
+                )
+
+            if not isinstance(
+                transactions,
+                list
+            ):
+
+                print(
+                    "Unexpected transaction format."
+                )
+
+                continue
+
+            print(
+                f"Transactions: "
+                f"{len(transactions)}"
+            )
+
+            profile = profiles.get(
+                wallet
+            )
+
+            # Process newest first
+            for tx in reversed(
+                transactions
+            ):
+
+                process_transaction(
+                    wallet_name,
+                    wallet,
+                    tx,
+                    profile
+                )
+
+            # small pause
+            time.sleep(
+                2
+            )
+
+        # Save state after cycle
+        save_seen()
+
+        print()
         print(
-            f"{winner['name']}"
+            f"Sleeping "
+            f"{POLL_INTERVAL}s..."
         )
 
-        print(
-            f"Score : "
-            f"{winner['score']['total']}/100"
+        time.sleep(
+            POLL_INTERVAL
         )
-
-        print(
-            f"Status: "
-            f"{winner['score']['status']}"
-        )
-
-    print()
-    print(
-        "ANALYSIS COMPLETE"
-    )
 
 
 # ============================================================
-# ENTRY POINT
+# ENTRY
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Bot stopped."
+        )
+
+        save_seen()
+
+    except Exception as e:
+
+        print()
+        print(
+            "FATAL ERROR:"
+        )
+
+        print(
+            repr(e)
+        )
+
+        save_seen()
+
+        raise
