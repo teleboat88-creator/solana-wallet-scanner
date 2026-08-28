@@ -89,15 +89,15 @@ def get_details(wallet):
     return response.json()
 
 
-def safe_number(value):
+def number(value):
 
     if value is None:
-        return 0
+        return 0.0
 
     try:
         return float(value)
-    except:
-        return 0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def calculate_score(summary, tokens):
@@ -105,29 +105,27 @@ def calculate_score(summary, tokens):
     counts = summary.get("counts", {})
     pnl = summary.get("pnl", {})
 
-    total_trade = safe_number(
+    total_trade = number(
         counts.get("total_trade")
     )
 
-    win_rate = safe_number(
+    win_rate = number(
         counts.get("win_rate")
     )
 
-    realized = safe_number(
+    realized = number(
         pnl.get("realized_profit_usd")
     )
 
-    unrealized = safe_number(
+    unrealized = number(
         pnl.get("unrealized_usd")
     )
 
-    total_pnl = safe_number(
+    total_pnl = number(
         pnl.get("total_usd")
     )
 
-    # -----------------------------
-    # 1. WIN RATE — 25 POINTS
-    # -----------------------------
+    # WIN RATE - 25 POINTS
 
     if win_rate >= 0.70:
         win_score = 25
@@ -140,24 +138,20 @@ def calculate_score(summary, tokens):
     else:
         win_score = 5
 
-    # -----------------------------
-    # 2. REALIZED PNL — 25 POINTS
-    # -----------------------------
+    # REALIZED PNL - 25 POINTS
 
-    if realized > 50000:
+    if realized >= 50000:
         realized_score = 25
-    elif realized > 25000:
+    elif realized >= 25000:
         realized_score = 22
-    elif realized > 10000:
+    elif realized >= 10000:
         realized_score = 18
     elif realized > 0:
         realized_score = 12
     else:
         realized_score = 0
 
-    # -----------------------------
-    # 3. TRADE EXPERIENCE — 15
-    # -----------------------------
+    # EXPERIENCE - 15 POINTS
 
     if total_trade >= 500:
         trade_score = 15
@@ -170,49 +164,41 @@ def calculate_score(summary, tokens):
     else:
         trade_score = 4
 
-    # -----------------------------
-    # 4. PROFIT DIVERSIFICATION
-    # -----------------------------
+    # PROFIT DIVERSIFICATION - 15 POINTS
 
-    profitable_tokens = []
+    profitable_tokens = 0
 
     for token in tokens:
 
-        token_pnl = safe_number(
+        token_pnl = number(
             token.get("pnl", {}).get(
                 "realized_profit_usd"
             )
         )
 
         if token_pnl > 0:
-            profitable_tokens.append(
-                token_pnl
-            )
+            profitable_tokens += 1
 
-    if len(profitable_tokens) >= 5:
+    if profitable_tokens >= 5:
         diversity_score = 15
-    elif len(profitable_tokens) >= 3:
+    elif profitable_tokens >= 3:
         diversity_score = 12
-    elif len(profitable_tokens) >= 2:
+    elif profitable_tokens >= 2:
         diversity_score = 9
-    elif len(profitable_tokens) >= 1:
+    elif profitable_tokens >= 1:
         diversity_score = 5
     else:
         diversity_score = 0
 
-    # -----------------------------
-    # 5. UNREALIZED RISK — 20
-    # -----------------------------
+    # UNREALIZED RISK - 20 POINTS
 
     if total_pnl > 0:
-
         unrealized_ratio = (
             max(unrealized, 0)
             / total_pnl
         )
-
     else:
-        unrealized_ratio = 1
+        unrealized_ratio = 1.0
 
     if unrealized_ratio < 0.30:
         risk_score = 20
@@ -246,25 +232,186 @@ def calculate_score(summary, tokens):
 
 def analyze_wallet(wallet_info):
 
-    wallet = wallet_info["address"]
     name = wallet_info["name"]
-
-    print()
-    print("=" * 70)
-    print(name)
-    print(wallet)
-    print("=" * 70)
+    wallet = wallet_info["address"]
 
     pnl_data = get_pnl(wallet)
 
-    if not pnl_data:
+    if pnl_data is None:
         return
 
-    detail_data = get_details(wallet)
+    details = get_details(wallet)
 
-    if not detail_data:
+    if details is None:
         return
 
-    summary = (
-        detail_data
-        .get("
+    data = details.get("data", {})
+
+    summary = data.get(
+        "summary",
+        {}
+    )
+
+    tokens = data.get(
+        "tokens",
+        []
+    )
+
+    counts = summary.get(
+        "counts",
+        {}
+    )
+
+    pnl = summary.get(
+        "pnl",
+        {}
+    )
+
+    score = calculate_score(
+        summary,
+        tokens
+    )
+
+    print()
+    print("=" * 60)
+    print(name)
+    print(wallet)
+    print("=" * 60)
+
+    print(
+        "Total Trade :",
+        counts.get("total_trade")
+    )
+
+    print(
+        "Win Rate    :",
+        round(
+            number(
+                counts.get("win_rate")
+            ) * 100,
+            2
+        ),
+        "%"
+    )
+
+    print(
+        "Realized PnL: $",
+        round(
+            number(
+                pnl.get(
+                    "realized_profit_usd"
+                )
+            ),
+            2
+        )
+    )
+
+    print(
+        "Unrealized  : $",
+        round(
+            number(
+                pnl.get(
+                    "unrealized_usd"
+                )
+            ),
+            2
+        )
+    )
+
+    print(
+        "Total PnL   : $",
+        round(
+            number(
+                pnl.get("total_usd")
+            ),
+            2
+        )
+    )
+
+    print()
+    print("TOKEN ANALYSIS")
+    print(
+        "Total Tokens:",
+        len(tokens)
+    )
+
+    profitable = 0
+    losing = 0
+
+    for token in tokens:
+
+        token_pnl = number(
+            token.get("pnl", {}).get(
+                "realized_profit_usd"
+            )
+        )
+
+        if token_pnl > 0:
+            profitable += 1
+        elif token_pnl < 0:
+            losing += 1
+
+    print(
+        "Profitable   :",
+        profitable
+    )
+
+    print(
+        "Losing       :",
+        losing
+    )
+
+    print()
+    print("SMART SCORE")
+    print("-----------")
+
+    print(
+        "Score              :",
+        score["score"],
+        "/100"
+    )
+
+    print(
+        "Win Rate Score     :",
+        score["win_score"],
+        "/25"
+    )
+
+    print(
+        "Realized Score     :",
+        score["realized_score"],
+        "/25"
+    )
+
+    print(
+        "Experience Score   :",
+        score["trade_score"],
+        "/15"
+    )
+
+    print(
+        "Diversification    :",
+        score["diversity_score"],
+        "/15"
+    )
+
+    print(
+        "Risk Score         :",
+        score["risk_score"],
+        "/20"
+    )
+
+    if score["score"] >= 80:
+        status = "CORE"
+    elif score["score"] >= 65:
+        status = "WATCH"
+    else:
+        status = "REJECT"
+
+    print(
+        "STATUS             :",
+        status
+    )
+
+    print()
+    print("TOP 5 TOKENS
