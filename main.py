@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import requests
 from dotenv import load_dotenv
 
@@ -31,8 +30,6 @@ def main():
         "offset": 0,
     }
 
-    print("Mengambil detail wallet...")
-
     response = requests.post(
         URL,
         headers=HEADERS,
@@ -43,52 +40,38 @@ def main():
     print("HTTP:", response.status_code)
 
     if response.status_code != 200:
-        print("ERROR:", response.text)
+        print(response.text)
         return
 
     data = response.json()
 
-    # Hanya tampilkan struktur utama
-    result = data.get("data", {})
+    tokens = data["data"]["tokens"]
 
     print(
-        "DATA_KEYS="
-        + json.dumps(
-            list(result.keys()),
-            separators=(",", ":")
-        )
+        "TOKEN_COUNT="
+        + str(len(tokens))
     )
 
-    for key, value in result.items():
-
-        if isinstance(value, list):
-            info = {
-                "key": key,
-                "type": "list",
-                "length": len(value)
-            }
-
-        elif isinstance(value, dict):
-            info = {
-                "key": key,
-                "type": "dict",
-                "keys": list(value.keys())
-            }
-
-        else:
-            info = {
-                "key": key,
-                "type": type(value).__name__,
-                "value": value
-            }
+    # Tampilkan struktur token pertama
+    if tokens:
 
         print(
-            "FIELD="
+            "FIRST_TOKEN="
             + json.dumps(
-                info,
+                tokens[0],
                 separators=(",", ":")
             )
         )
+
+        print(
+            "TOKEN_KEYS="
+            + json.dumps(
+                list(tokens[0].keys()),
+                separators=(",", ":")
+            )
+        )
+
+    print("TOKEN_ANALYSIS_READY")
 
 
 if __name__ == "__main__":
