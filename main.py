@@ -23,11 +23,13 @@ HEADERS = {
 
 
 def get_wallet_pnl(wallet):
-    url = f"{BASE_URL}/wallet/v2/pnl"
+    url = f"{BASE_URL}/wallet/v2/pnl/summary"
 
     params = {
         "wallet": wallet,
         "duration": "90d",
+        "position_scope": "duration_only",
+        "pnl_method": "net_cash",
     }
 
     response = requests.get(
@@ -49,10 +51,13 @@ def get_wallet_pnl(wallet):
 def get_wallet_pnl_details(wallet):
     url = f"{BASE_URL}/wallet/v2/pnl/details"
 
-    params = {
+    payload = {
         "wallet": wallet,
         "duration": "90d",
         "position_scope": "duration_only",
+        "pnl_method": "net_cash",
+        "sort_by": "last_trade",
+        "sort_type": "desc",
         "limit": 100,
         "offset": 0,
     }
@@ -60,7 +65,7 @@ def get_wallet_pnl_details(wallet):
     response = requests.post(
         url,
         headers=HEADERS,
-        json=params,
+        json=payload,
         timeout=30,
     )
 
@@ -73,43 +78,31 @@ def get_wallet_pnl_details(wallet):
     return response.json()
 
 
-def print_result(wallet, pnl, details):
-
-    print("\n" + "=" * 70)
-    print("WALLET")
-    print(wallet)
-    print("=" * 70)
-
-    print("\n--- PNL SUMMARY ---")
-
-    if pnl:
-        print(pnl)
-
-    print("\n--- PNL DETAILS ---")
-
-    if details:
-        print(details)
-
-
 def main():
 
+    print("=" * 70)
     print("SOLANA WALLET ANALYZER")
-    print("Analyzing", len(WALLETS), "wallets...\n")
+    print("=" * 70)
+    print(f"Analyzing {len(WALLETS)} wallets...\n")
 
     for wallet in WALLETS:
 
-        print("\nAnalyzing wallet:")
+        print("\n" + "=" * 70)
+        print("WALLET:")
         print(wallet)
+        print("=" * 70)
 
         pnl = get_wallet_pnl(wallet)
 
+        if pnl:
+            print("\n--- PNL SUMMARY ---")
+            print(pnl)
+
         details = get_wallet_pnl_details(wallet)
 
-        print_result(
-            wallet,
-            pnl,
-            details,
-        )
+        if details:
+            print("\n--- PNL DETAILS ---")
+            print(details)
 
 
 if __name__ == "__main__":
