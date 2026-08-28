@@ -2,520 +2,128 @@ import os
 import time
 import json
 import requests
-from collections import deque
 from dotenv import load_dotenv
 
-# ============================================================
-# SMART MONEY WALLET MONITOR V10
-# SOLANA
-# BIRDEYE
-# TELEGRAM
-#
-# FOCUS:
-# - BUY
-# - SELL
-# - WALLET MOVEMENT
-#
-# NO PNL ENDPOINT
-# NO ONLINE MESSAGE
-# NO STARTUP TELEGRAM MESSAGE
-# ============================================================
-
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
 load_dotenv()
-
-API_KEY = os.getenv("BIRDEYE_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-if not API_KEY:
-    raise RuntimeError(
-        "BIRDEYE_API_KEY belum diatur"
-    )
-
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN belum diatur"
-    )
-
-
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError(
-        "TELEGRAM_CHAT_ID belum diatur"
-    )
-
-
-# ============================================================
-# WALLETS
-# ============================================================
-
-WALLETS = [
-    (
-        "CORE_CANDIDATE",
-        "9xn3JjPreFAaAEBZL3VVvcou33jrfRWhsuiNbD4sJcEe"
-    ),
-    (
-        "CONTROL",
-        "F6Fh9BjBXb1GyacHto4cwqcKF4K4xK8SwEyDv9Ayp8j9"
-    ),
-]
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BASE_URL = "https://public-api.birdeye.so"
+RPC_URL = os.getenv(
+    "SOLANA_RPC_URL",
+    "https://api.mainnet-beta.solana.com"
+)
 
-HEADERS = {
-    "X-API-KEY": API_KEY,
-    "x-chain": "solana",
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
+
+POLL_INTERVAL = int(
+    os.getenv("POLL_INTERVAL", "15")
+)
+
+SIGNATURE_LIMIT = 10
+
+STATE_FILE = "wallet_state.json"
+
+# ============================================================
+# 3 WALLET YANG DIPANTAU
+# ============================================================
+
+WALLETS = {
+    "CORE_CANDIDATE":
+        "9xn3JjPreFAaAEBZL3VVvcou33jrfRWhsuiNbD4sJcEe",
+
+    "CONTROL":
+        "F6Fh9BjBXb1GyacHto4cwqcKF4K4xK8SwEyDv9Ayp8j9",
+
+    "WALLET_3":
+        "5d8tDay1ZDV4XVUBtTvFvQiLxDe8dz2ZCdsrkmTDcbm5",
 }
 
-
-# Jangan mendekati limit 60 RPM.
-# Target bot sekitar 10-20 RPM.
-POLL_INTERVAL = 30
-
-REQUEST_TIMEOUT = 30
-
-MAX_RETRIES = 4
-
-RETRY_BASE_SECONDS = 10
-
-TX_LIMIT = 20
-
-MAX_SEEN_TRANSACTIONS = 1000
-
-TOKEN_CACHE_FILE = "token_cache.json"
-
-SEEN_FILE = "seen_transactions.json"
-
-
 # ============================================================
-# MEMORY
+# SOLANA RPC
 # ============================================================
 
-seen_transactions = set()
+session = requests.Session()
 
-token_cache = {}
-
-# pencatat request untuk proteksi RPM
-request_times = deque()
-
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
-def num(value):
-
-    try:
-        return float(value or 0)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-
-        return 0.0
+session.headers.update({
+    "Content-Type": "application/json"
+})
 
 
-def safe_text(
-    value,
-    default="UNKNOWN"
-):
+def rpc_call(method, params):
 
-    if value is None:
-        return default
-
-    value = str(value).strip()
-
-    if not value:
-        return default
-
-    return value
-
-
-def money(value):
-
-    value = num(value)
-
-    return f"${value:,.2f}"
-
-
-def shorten(
-    value,
-    length=16
-):
-
-    value = safe_text(
-        value,
-        ""
-    )
-
-    if not value:
-        return ""
-
-    if len(value) <= length:
-        return value
-
-    return (
-        value[:length]
-        + "..."
-    )
-
-
-# ============================================================
-# LOCAL JSON
-# ============================================================
-
-def load_json(
-    filename,
-    default
-):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    }
 
     try:
 
-        if not os.path.exists(
-            filename
-        ):
-
-            return default
-
-        with open(
-            filename,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception as e:
-
-        print(
-            f"LOAD ERROR {filename}: {e}"
+        r = session.post(
+            RPC_URL,
+            json=payload,
+            timeout=30
         )
 
-        return default
-
-
-def save_json(
-    filename,
-    data
-):
-
-    try:
-
-        with open(
-            filename,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as e:
-
-        print(
-            f"SAVE ERROR {filename}: {e}"
-        )
-
-
-def load_state():
-
-    global seen_transactions
-    global token_cache
-
-    seen = load_json(
-        SEEN_FILE,
-        []
-    )
-
-    if isinstance(
-        seen,
-        list
-    ):
-
-        seen_transactions = set(
-            seen
-        )
-
-    token_cache = load_json(
-        TOKEN_CACHE_FILE,
-        {}
-    )
-
-    print(
-        f"Seen TX : "
-        f"{len(seen_transactions)}"
-    )
-
-    print(
-        f"Tokens  : "
-        f"{len(token_cache)}"
-    )
-
-
-def save_state():
-
-    global seen_transactions
-
-    if len(
-        seen_transactions
-    ) > MAX_SEEN_TRANSACTIONS:
-
-        # set tidak memiliki urutan,
-        # jadi simpan sebagian terakhir
-        seen_transactions = set(
-            list(
-                seen_transactions
-            )[
-                -MAX_SEEN_TRANSACTIONS:
-            ]
-        )
-
-    save_json(
-        SEEN_FILE,
-        list(
-            seen_transactions
-        )
-    )
-
-    save_json(
-        TOKEN_CACHE_FILE,
-        token_cache
-    )
-
-
-# ============================================================
-# RATE LIMITER
-# ============================================================
-
-def wait_for_rate_limit():
-
-    now = time.time()
-
-    # Buang request yang sudah lebih
-    # dari 60 detik.
-    while request_times:
-
-        if (
-            now
-            - request_times[0]
-            > 60
-        ):
-
-            request_times.popleft()
-
-        else:
-
-            break
-
-    # Safety limit internal.
-    # Kita sengaja hanya memakai maksimal
-    # 45 request dalam 60 detik.
-    if len(request_times) >= 45:
-
-        wait = (
-            60
-            - (
-                now
-                - request_times[0]
-            )
-            + 1
-        )
-
-        print(
-            f"Internal rate protection "
-            f"waiting {wait:.1f}s"
-        )
-
-        time.sleep(
-            max(wait, 1)
-        )
-
-    request_times.append(
-        time.time()
-    )
-
-
-# ============================================================
-# BIRDEYE GET
-# ============================================================
-
-def api_get(
-    endpoint,
-    params=None
-):
-
-    for attempt in range(
-        MAX_RETRIES
-    ):
-
-        wait_for_rate_limit()
-
-        try:
-
-            response = requests.get(
-                f"{BASE_URL}{endpoint}",
-                headers=HEADERS,
-                params=params or {},
-                timeout=REQUEST_TIMEOUT
-            )
-
-            # ------------------------------------------------
-            # SUCCESS
-            # ------------------------------------------------
-
-            if response.status_code == 200:
-
-                try:
-
-                    return response.json()
-
-                except ValueError:
-
-                    print(
-                        "Invalid JSON response"
-                    )
-
-                    return None
-
-            # ------------------------------------------------
-            # RATE LIMIT
-            # ------------------------------------------------
-
-            if response.status_code == 429:
-
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
-                    )
-                )
-
-                if retry_after:
-
-                    try:
-
-                        wait = float(
-                            retry_after
-                        )
-
-                    except ValueError:
-
-                        wait = (
-                            RETRY_BASE_SECONDS
-                            * (
-                                2
-                                ** attempt
-                            )
-                        )
-
-                else:
-
-                    wait = (
-                        RETRY_BASE_SECONDS
-                        * (
-                            2
-                            ** attempt
-                        )
-                    )
-
-                print(
-                    f"429 RATE LIMIT | "
-                    f"retry {attempt + 1}/"
-                    f"{MAX_RETRIES} | "
-                    f"wait {wait:.1f}s"
-                )
-
-                time.sleep(
-                    wait
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # AUTH
-            # ------------------------------------------------
-
-            if response.status_code in (
-                401,
-                403
-            ):
-
-                print(
-                    f"AUTH ERROR "
-                    f"{response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-
-                return None
-
-            # ------------------------------------------------
-            # OTHER
-            # ------------------------------------------------
+        if r.status_code != 200:
 
             print(
-                f"API ERROR "
-                f"{response.status_code}: "
-                f"{response.text[:500]}"
+                f"RPC HTTP ERROR {r.status_code}: "
+                f"{r.text[:300]}"
             )
 
             return None
 
-        except requests.RequestException as e:
+        data = r.json()
 
-            wait = (
-                RETRY_BASE_SECONDS
-                * (
-                    2
-                    ** attempt
-                )
-            )
+        if "error" in data:
 
             print(
-                f"REQUEST ERROR: {e}"
+                "RPC ERROR:",
+                data["error"]
             )
 
-            print(
-                f"Retry in {wait}s"
-            )
+            return None
 
-            time.sleep(
-                wait
-            )
+        return data.get("result")
 
-    print(
-        "API RETRIES EXHAUSTED"
-    )
+    except Exception as e:
 
-    return None
+        print(
+            "RPC REQUEST ERROR:",
+            e
+        )
+
+        return None
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram(
-    message
-):
+def send_telegram(message):
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN belum diatur")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_CHAT_ID belum diatur")
+        return False
 
     url = (
         "https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}"
-        "/sendMessage"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
     )
 
     payload = {
@@ -526,799 +134,656 @@ def send_telegram(
 
     try:
 
-        response = requests.post(
+        r = session.post(
             url,
             json=payload,
             timeout=20
         )
 
-        if response.status_code != 200:
+        if r.status_code != 200:
 
             print(
-                "TELEGRAM ERROR:"
-            )
-
-            print(
-                response.text[:500]
+                "TELEGRAM ERROR:",
+                r.text[:300]
             )
 
             return False
 
         return True
 
-    except requests.RequestException as e:
+    except Exception as e:
 
         print(
-            f"TELEGRAM ERROR: {e}"
+            "TELEGRAM REQUEST ERROR:",
+            e
         )
 
         return False
 
 
 # ============================================================
-# WALLET TRANSACTION LIST
+# STATE
 # ============================================================
 
-def get_transactions(
+def load_state():
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            return json.load(f)
+
+    except Exception:
+
+        return {}
+
+
+def save_state(state):
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                state,
+                f,
+                indent=2
+            )
+
+    except Exception as e:
+
+        print(
+            "STATE SAVE ERROR:",
+            e
+        )
+
+
+# ============================================================
+# GET LATEST SIGNATURES
+# ============================================================
+
+def get_signatures(wallet):
+
+    result = rpc_call(
+        "getSignaturesForAddress",
+        [
+            wallet,
+            {
+                "limit": SIGNATURE_LIMIT,
+                "commitment": "confirmed"
+            }
+        ]
+    )
+
+    if not result:
+        return []
+
+    return result
+
+
+# ============================================================
+# GET TRANSACTION
+# ============================================================
+
+def get_transaction(signature):
+
+    return rpc_call(
+        "getTransaction",
+        [
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }
+        ]
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def lamports_to_sol(value):
+
+    try:
+        return float(value) / 1_000_000_000
+
+    except Exception:
+
+        return 0.0
+
+
+def get_account_keys(tx):
+
+    try:
+
+        return (
+            tx["transaction"]
+            ["message"]
+            ["accountKeys"]
+        )
+
+    except Exception:
+
+        return []
+
+
+def get_wallet_balance_change(
+    tx,
     wallet
 ):
 
-    data = api_get(
-        "/v1/wallet/tx_list",
-        {
-            "wallet": wallet,
-            "limit": TX_LIMIT
-        }
-    )
+    try:
 
-    if not data:
+        meta = tx.get(
+            "meta"
+        )
 
-        return []
+        if not meta:
+            return 0.0
 
-    data_section = data.get(
-        "data",
-        {}
-    )
+        keys = get_account_keys(
+            tx
+        )
 
-    # Beberapa response memakai
-    # data.solana
-    transactions = (
-        data_section.get(
-            "solana",
+        wallet_index = None
+
+        for i, item in enumerate(keys):
+
+            if isinstance(
+                item,
+                dict
+            ):
+
+                pubkey = item.get(
+                    "pubkey"
+                )
+
+            else:
+
+                pubkey = item
+
+            if pubkey == wallet:
+
+                wallet_index = i
+                break
+
+        if wallet_index is None:
+            return 0.0
+
+        pre = meta.get(
+            "preBalances",
             []
         )
-    )
 
-    # Fallback
-    if not transactions:
-
-        transactions = (
-            data_section.get(
-                "items",
-                []
-            )
+        post = meta.get(
+            "postBalances",
+            []
         )
 
-    if not isinstance(
-        transactions,
-        list
-    ):
+        if (
+            wallet_index >= len(pre)
+            or wallet_index >= len(post)
+        ):
+            return 0.0
 
-        return []
+        change = (
+            post[wallet_index]
+            - pre[wallet_index]
+        )
 
-    return transactions
+        return lamports_to_sol(
+            change
+        )
+
+    except Exception:
+
+        return 0.0
 
 
 # ============================================================
-# TRANSACTION ID
+# TOKEN BALANCE CHANGES
 # ============================================================
 
-def get_tx_id(
-    tx
+def token_changes(
+    tx,
+    wallet
 ):
 
-    if not isinstance(
-        tx,
-        dict
-    ):
+    changes = []
+
+    try:
+
+        meta = tx.get(
+            "meta"
+        )
+
+        if not meta:
+            return changes
+
+        pre = meta.get(
+            "preTokenBalances",
+            []
+        )
+
+        post = meta.get(
+            "postTokenBalances",
+            []
+        )
+
+        # ----------------------------------------------------
+        # PRE
+        # ----------------------------------------------------
+
+        before = {}
+
+        for item in pre:
+
+            owner = item.get(
+                "owner"
+            )
+
+            if owner != wallet:
+                continue
+
+            mint = item.get(
+                "mint"
+            )
+
+            amount = (
+                item.get(
+                    "uiTokenAmount",
+                    {}
+                )
+                .get(
+                    "uiAmount",
+                    0
+                )
+            )
+
+            before[mint] = (
+                before.get(
+                    mint,
+                    0
+                )
+                + float(amount or 0)
+            )
+
+        # ----------------------------------------------------
+        # POST
+        # ----------------------------------------------------
+
+        after = {}
+
+        for item in post:
+
+            owner = item.get(
+                "owner"
+            )
+
+            if owner != wallet:
+                continue
+
+            mint = item.get(
+                "mint"
+            )
+
+            amount = (
+                item.get(
+                    "uiTokenAmount",
+                    {}
+                )
+                .get(
+                    "uiAmount",
+                    0
+                )
+            )
+
+            after[mint] = (
+                after.get(
+                    mint,
+                    0
+                )
+                + float(amount or 0)
+            )
+
+        # ----------------------------------------------------
+        # COMPARE
+        # ----------------------------------------------------
+
+        all_mints = (
+            set(before)
+            | set(after)
+        )
+
+        for mint in all_mints:
+
+            old = before.get(
+                mint,
+                0
+            )
+
+            new = after.get(
+                mint,
+                0
+            )
+
+            change = new - old
+
+            if abs(change) < 0.00000001:
+                continue
+
+            changes.append({
+                "mint": mint,
+                "change": change,
+                "before": old,
+                "after": new
+            })
+
+    except Exception as e:
+
+        print(
+            "TOKEN PARSE ERROR:",
+            e
+        )
+
+    return changes
+
+
+# ============================================================
+# DETECT BUY / SELL
+# ============================================================
+
+def analyze_transaction(
+    tx,
+    wallet
+):
+
+    if not tx:
+        return None
+
+    if tx.get(
+        "meta",
+        {}
+    ).get("err") is not None:
 
         return None
 
-    for key in (
-        "txHash",
-        "tx_hash",
-        "signature",
-        "transactionHash",
-        "hash"
+    tokens = token_changes(
+        tx,
+        wallet
+    )
+
+    if not tokens:
+        return None
+
+    sol_change = get_wallet_balance_change(
+        tx,
+        wallet
+    )
+
+    received = [
+        x for x in tokens
+        if x["change"] > 0
+    ]
+
+    sent = [
+        x for x in tokens
+        if x["change"] < 0
+    ]
+
+    # --------------------------------------------------------
+    # BUY
+    #
+    # Wallet kehilangan SOL
+    # dan mendapatkan token.
+    # --------------------------------------------------------
+
+    if (
+        sol_change < -0.00001
+        and received
     ):
 
-        value = tx.get(
-            key
+        token = max(
+            received,
+            key=lambda x: x["change"]
         )
 
-        if value:
+        return {
+            "side": "BUY",
+            "mint": token["mint"],
+            "amount": token["change"],
+            "sol_change": sol_change
+        }
 
-            return str(
-                value
-            )
+    # --------------------------------------------------------
+    # SELL
+    #
+    # Wallet mendapatkan SOL
+    # dan kehilangan token.
+    # --------------------------------------------------------
+
+    if (
+        sol_change > 0.00001
+        and sent
+    ):
+
+        token = max(
+            sent,
+            key=lambda x: abs(x["change"])
+        )
+
+        return {
+            "side": "SELL",
+            "mint": token["mint"],
+            "amount": abs(token["change"]),
+            "sol_change": sol_change
+        }
 
     return None
 
 
 # ============================================================
-# FIND VALUES RECURSIVELY
+# TELEGRAM MESSAGE
 # ============================================================
 
-def find_values(
-    obj,
-    target_keys
-):
-
-    found = []
-
-    target_keys = {
-        str(x).lower()
-        for x in target_keys
-    }
-
-    def walk(
-        value
-    ):
-
-        if isinstance(
-            value,
-            dict
-        ):
-
-            for key, item in value.items():
-
-                key_lower = str(
-                    key
-                ).lower()
-
-                if key_lower in target_keys:
-
-                    found.append(
-                        item
-                    )
-
-                walk(
-                    item
-                )
-
-        elif isinstance(
-            value,
-            list
-        ):
-
-            for item in value:
-
-                walk(
-                    item
-                )
-
-    walk(
-        obj
-    )
-
-    return found
-
-
-# ============================================================
-# DETECT SIDE
-# ============================================================
-
-def detect_side(
-    tx
-):
-
-    # --------------------------------------------------------
-    # 1. Explicit fields
-    # --------------------------------------------------------
-
-    side_values = find_values(
-        tx,
-        {
-            "side",
-            "action",
-            "trade_type",
-            "tx_type",
-            "type",
-            "event_type"
-        }
-    )
-
-    for value in side_values:
-
-        text = str(
-            value
-        ).lower().strip()
-
-        if text in (
-            "buy",
-            "bought",
-            "swap_buy"
-        ):
-
-            return "BUY"
-
-        if text in (
-            "sell",
-            "sold",
-            "swap_sell"
-        ):
-
-            return "SELL"
-
-    # --------------------------------------------------------
-    # 2. Search textual fields
-    # --------------------------------------------------------
-
-    text_values = find_values(
-        tx,
-        {
-            "description",
-            "name",
-            "label",
-            "description_text"
-        }
-    )
-
-    for value in text_values:
-
-        text = str(
-            value
-        ).lower()
-
-        if "buy" in text:
-
-            return "BUY"
-
-        if "sell" in text:
-
-            return "SELL"
-
-    # --------------------------------------------------------
-    # Unknown
-    # --------------------------------------------------------
-
-    return "UNKNOWN"
-
-
-# ============================================================
-# TOKEN ADDRESSES
-# ============================================================
-
-def find_token_addresses(
-    tx
-):
-
-    values = find_values(
-        tx,
-        {
-            "token_address",
-            "tokenAddress",
-            "mint",
-            "token_mint",
-            "tokenMint",
-            "address"
-        }
-    )
-
-    addresses = []
-
-    for value in values:
-
-        if not isinstance(
-            value,
-            str
-        ):
-
-            continue
-
-        value = value.strip()
-
-        # Solana mint biasanya
-        # sekitar 32-44 karakter.
-        if (
-            32
-            <= len(value)
-            <= 50
-        ):
-
-            if value not in addresses:
-
-                addresses.append(
-                    value
-                )
-
-    return addresses
-
-
-# ============================================================
-# TOKEN INFO
-# ============================================================
-
-def get_token_info(
-    address
-):
-
-    if not address:
-
-        return None
-
-    if address in token_cache:
-
-        return token_cache[
-            address
-        ]
-
-    data = api_get(
-        "/defi/token_overview",
-        {
-            "address": address
-        }
-    )
-
-    if not data:
-
-        return None
-
-    info = data.get(
-        "data",
-        {}
-    )
-
-    if not isinstance(
-        info,
-        dict
-    ):
-
-        return None
-
-    token_cache[
-        address
-    ] = info
-
-    save_json(
-        TOKEN_CACHE_FILE,
-        token_cache
-    )
-
-    return info
-
-
-# ============================================================
-# FIND BEST TOKEN
-# ============================================================
-
-def choose_token(
-    tx
-):
-
-    addresses = find_token_addresses(
-        tx
-    )
-
-    if not addresses:
-
-        return None, None
-
-    # Coba satu per satu sampai
-    # mendapatkan token overview.
-    for address in addresses:
-
-        info = get_token_info(
-            address
-        )
-
-        if info:
-
-            return (
-                address,
-                info
-            )
-
-    # Jika overview tidak tersedia,
-    # tetap kembalikan address pertama.
-    return (
-        addresses[0],
-        {}
-    )
-
-
-# ============================================================
-# EXTRACT AMOUNT
-# ============================================================
-
-def find_amount(
-    tx
-):
-
-    values = find_values(
-        tx,
-        {
-            "amount",
-            "ui_amount",
-            "uiAmount",
-            "token_amount",
-            "tokenAmount",
-            "value"
-        }
-    )
-
-    for value in values:
-
-        number = num(
-            value
-        )
-
-        if number > 0:
-
-            return number
-
-    return 0.0
-
-
-# ============================================================
-# BUILD WALLET MOVEMENT
-# ============================================================
-
-def build_wallet_message(
+def build_message(
     wallet_name,
     wallet,
-    tx,
-    side,
-    token_address,
-    token_info
+    signature,
+    analysis
 ):
 
-    symbol = safe_text(
-        token_info.get(
-            "symbol"
-        )
-        if token_info
-        else None
-    )
-
-    token_name = safe_text(
-        token_info.get(
-            "name"
-        )
-        if token_info
-        else None
-    )
-
-    price = num(
-        token_info.get(
-            "price"
-        )
-        if token_info
-        else 0
-    )
-
-    liquidity = num(
-        token_info.get(
-            "liquidity"
-        )
-        if token_info
-        else 0
-    )
-
-    market_cap = num(
-        token_info.get(
-            "mc"
-        )
-        if token_info
-        else 0
-    )
-
-    holders = num(
-        token_info.get(
-            "holder"
-        )
-        if token_info
-        else 0
-    )
-
-    buy_24h = num(
-        token_info.get(
-            "buy24h"
-        )
-        if token_info
-        else 0
-    )
-
-    sell_24h = num(
-        token_info.get(
-            "sell24h"
-        )
-        if token_info
-        else 0
-    )
-
-    change_24h = num(
-        token_info.get(
-            "priceChange24hPercent"
-        )
-        if token_info
-        else 0
-    )
-
-    tx_id = get_tx_id(
-        tx
-    )
-
-    amount = find_amount(
-        tx
-    )
+    side = analysis["side"]
 
     if side == "BUY":
 
-        title = "🟢 WALLET BUY"
-
-    elif side == "SELL":
-
-        title = "🔴 WALLET SELL"
+        emoji = "🟢"
+        title = "WALLET BUY"
 
     else:
 
-        title = "🔵 WALLET MOVEMENT"
+        emoji = "🔴"
+        title = "WALLET SELL"
+
+    mint = analysis["mint"]
+
+    amount = analysis["amount"]
+
+    sol_change = analysis[
+        "sol_change"
+    ]
 
     message = (
-        f"{title}\n"
+        f"{emoji} {title}\n"
         "\n"
         f"👛 Wallet: {wallet_name}\n"
         f"📍 {wallet}\n"
         "\n"
-        f"🪙 Token: {symbol}\n"
-        f"📛 Name: {token_name}\n"
-        f"🔑 Mint: {token_address}\n"
-    )
-
-    if amount > 0:
-
-        message += (
-            f"\n"
-            f"💰 Amount: "
-            f"{amount:,.6f}"
-        )
-
-    if price > 0:
-
-        message += (
-            f"\n"
-            f"💵 Price: "
-            f"{money(price)}"
-        )
-
-    if liquidity > 0:
-
-        message += (
-            f"\n"
-            f"💧 Liquidity: "
-            f"{money(liquidity)}"
-        )
-
-    if market_cap > 0:
-
-        message += (
-            f"\n"
-            f"🏦 Market Cap: "
-            f"{money(market_cap)}"
-        )
-
-    if holders > 0:
-
-        message += (
-            f"\n"
-            f"👥 Holders: "
-            f"{int(holders):,}"
-        )
-
-    message += (
+        f"🪙 Token Mint:\n"
+        f"{mint}\n"
         "\n"
+        f"🔢 Token Amount: "
+        f"{amount:,.8f}\n"
+        f"◎ SOL Change: "
+        f"{sol_change:+.6f} SOL\n"
         "\n"
-        f"📊 24H BUY: "
-        f"{int(buy_24h):,}\n"
-        f"📉 24H SELL: "
-        f"{int(sell_24h):,}\n"
-        f"📈 24H Change: "
-        f"{change_24h:.2f}%"
-    )
-
-    if tx_id:
-
-        message += (
-            "\n\n"
-            f"🔗 TX: "
-            f"{shorten(tx_id, 24)}"
-        )
-
-    message += (
-        "\n\n"
-        "⚠️ Wallet movement detected."
+        f"🔗 Transaction:\n"
+        f"https://solscan.io/tx/{signature}"
     )
 
     return message
 
 
 # ============================================================
-# PROCESS TRANSACTION
+# INITIALIZE
 # ============================================================
 
-def process_transaction(
-    wallet_name,
-    wallet,
-    tx
-):
+def initialize_state():
 
-    tx_id = get_tx_id(
-        tx
-    )
+    state = load_state()
 
-    if not tx_id:
+    changed = False
 
-        return
+    for name, wallet in WALLETS.items():
 
-    # Jangan ulangi
-    if tx_id in seen_transactions:
-
-        return
-
-    # --------------------------------------------------------
-    # DETECT SIDE
-    # --------------------------------------------------------
-
-    side = detect_side(
-        tx
-    )
-
-    # --------------------------------------------------------
-    # TOKEN
-    # --------------------------------------------------------
-
-    token_address, token_info = (
-        choose_token(
-            tx
-        )
-    )
-
-    # Tandai sudah diproses
-    seen_transactions.add(
-        tx_id
-    )
-
-    # --------------------------------------------------------
-    # UNKNOWN MOVEMENT
-    # --------------------------------------------------------
-
-    if side == "UNKNOWN":
-
-        print(
-            f"Movement detected but "
-            f"side unknown: {tx_id}"
-        )
-
-        return
-
-    if not token_address:
-
-        print(
-            f"{side} detected but "
-            f"token tidak ditemukan: "
-            f"{tx_id}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # CONSOLE
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "=========================================="
-    )
-
-    print(
-        f"{side} DETECTED"
-    )
-
-    print(
-        f"Wallet : {wallet_name}"
-    )
-
-    print(
-        f"Token  : "
-        f"{token_address}"
-    )
-
-    print(
-        f"TX     : "
-        f"{tx_id}"
-    )
-
-    # --------------------------------------------------------
-    # MESSAGE
-    # --------------------------------------------------------
-
-    message = build_wallet_message(
-        wallet_name,
-        wallet,
-        tx,
-        side,
-        token_address,
-        token_info
-    )
-
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
-    sent = send_telegram(
-        message
-    )
-
-    if sent:
-
-        print(
-            "Telegram sent."
-        )
-
-    else:
-
-        print(
-            "Telegram failed."
-        )
-
-
-# ============================================================
-# INITIAL SNAPSHOT
-# ============================================================
-
-def create_initial_snapshot():
-
-    print()
-    print(
-        "Creating initial snapshot..."
-    )
-
-    for (
-        wallet_name,
-        wallet
-    ) in WALLETS:
-
-        transactions = get_transactions(
+        signatures = get_signatures(
             wallet
         )
 
-        print(
-            f"{wallet_name}: "
-            f"{len(transactions)} transactions"
-        )
+        if not signatures:
+            continue
 
-        for tx in transactions:
+        latest = signatures[0][
+            "signature"
+        ]
 
-            tx_id = get_tx_id(
-                tx
+        if name not in state:
+
+            state[name] = latest
+
+            changed = True
+
+            print(
+                f"{name}: initial snapshot saved"
             )
 
-            if tx_id:
+    if changed:
 
-                seen_transactions.add(
-                    tx_id
-                )
-
-        time.sleep(
-            3
+        save_state(
+            state
         )
 
-    save_state()
+    return state
 
-    print(
-        f"Initial snapshot saved: "
-        f"{len(seen_transactions)} TX"
+
+# ============================================================
+# CHECK WALLET
+# ============================================================
+
+def check_wallet(
+    name,
+    wallet,
+    state
+):
+
+    signatures = get_signatures(
+        wallet
+    )
+
+    if not signatures:
+        return
+
+    last_signature = state.get(
+        name
+    )
+
+    new_transactions = []
+
+    for item in signatures:
+
+        signature = item.get(
+            "signature"
+        )
+
+        if not signature:
+            continue
+
+        if signature == last_signature:
+            break
+
+        new_transactions.append(
+            signature
+        )
+
+    # Tidak ada transaksi baru
+    if not new_transactions:
+        return
+
+    # --------------------------------------------------------
+    # Process oldest -> newest
+    # --------------------------------------------------------
+
+    for signature in reversed(
+        new_transactions
+    ):
+
+        print(
+            f"{name} new TX: "
+            f"{signature[:20]}..."
+        )
+
+        tx = get_transaction(
+            signature
+        )
+
+        if not tx:
+            continue
+
+        analysis = analyze_transaction(
+            tx,
+            wallet
+        )
+
+        if not analysis:
+            continue
+
+        message = build_message(
+            name,
+            wallet,
+            signature,
+            analysis
+        )
+
+        print(
+            f"{analysis['side']} detected: "
+            f"{analysis['mint']}"
+        )
+
+        send_telegram(
+            message
+        )
+
+        # Sedikit jeda supaya
+        # tidak spam Telegram
+        time.sleep(1)
+
+    # Simpan transaksi terbaru
+    state[name] = signatures[0][
+        "signature"
+    ]
+
+    save_state(
+        state
     )
 
 
@@ -1328,53 +793,28 @@ def create_initial_snapshot():
 
 def main():
 
-    print()
     print(
-        "=============================================="
+        "SMART MONEY WALLET MONITOR"
     )
 
     print(
-        "       SMART MONEY WALLET MONITOR V10"
+        "Wallets:",
+        len(WALLETS)
     )
 
     print(
-        "=============================================="
+        "RPC:",
+        RPC_URL
     )
-
-    print(
-        "Mode          : Wallet Movement"
-    )
-
-    print(
-        "Telegram      : BUY / SELL only"
-    )
-
-    print(
-        "PnL Endpoint  : DISABLED"
-    )
-
-    print(
-        "RPM Safety    : 45 / 60"
-    )
-
-    print(
-        f"Poll Interval : "
-        f"{POLL_INTERVAL}s"
-    )
-
-    print(
-        "=============================================="
-    )
-
-    load_state()
 
     # --------------------------------------------------------
     # INITIAL SNAPSHOT
+    #
+    # Transaksi lama TIDAK dikirim Telegram.
     # --------------------------------------------------------
 
-    create_initial_snapshot()
+    state = initialize_state()
 
-    print()
     print(
         "Monitoring started."
     )
@@ -1383,65 +823,27 @@ def main():
     # LOOP
     # --------------------------------------------------------
 
-    cycle = 0
-
     while True:
 
-        cycle += 1
+        for name, wallet in WALLETS.items():
 
-        print()
-        print(
-            f"[CYCLE {cycle}] "
-            f"Checking wallets..."
-        )
+            try:
 
-        for (
-            wallet_name,
-            wallet
-        ) in WALLETS:
-
-            print(
-                f"Checking "
-                f"{wallet_name}"
-            )
-
-            transactions = get_transactions(
-                wallet
-            )
-
-            print(
-                f"Transactions: "
-                f"{len(transactions)}"
-            )
-
-            # ------------------------------------------------
-            # Process oldest -> newest
-            # ------------------------------------------------
-
-            for tx in reversed(
-                transactions
-            ):
-
-                process_transaction(
-                    wallet_name,
+                check_wallet(
+                    name,
                     wallet,
-                    tx
+                    state
                 )
 
-            time.sleep(
-                2
-            )
+            except Exception as e:
 
-        # ----------------------------------------------------
-        # SAVE
-        # ----------------------------------------------------
+                print(
+                    f"{name} ERROR:",
+                    repr(e)
+                )
 
-        save_state()
-
-        print(
-            f"Sleeping "
-            f"{POLL_INTERVAL}s..."
-        )
+            # Jeda antar-wallet
+            time.sleep(1)
 
         time.sleep(
             POLL_INTERVAL
@@ -1449,33 +851,9 @@ def main():
 
 
 # ============================================================
-# ENTRY
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
 
-    try:
-
-        main()
-
-    except KeyboardInterrupt:
-
-        print(
-            "Bot stopped."
-        )
-
-        save_state()
-
-    except Exception as e:
-
-        print(
-            "FATAL ERROR:"
-        )
-
-        print(
-            repr(e)
-        )
-
-        save_state()
-
-        raise
+    main()
