@@ -25,15 +25,14 @@ HEADERS = {
 
 
 def get_value(obj, key):
-    """
-    Mencari key secara rekursif di seluruh JSON.
-    """
+
     if isinstance(obj, dict):
 
         if key in obj:
             return obj[key]
 
         for value in obj.values():
+
             result = get_value(value, key)
 
             if result is not None:
@@ -42,6 +41,7 @@ def get_value(obj, key):
     elif isinstance(obj, list):
 
         for item in obj:
+
             result = get_value(item, key)
 
             if result is not None:
@@ -59,12 +59,6 @@ def analyze_wallet(wallet):
         "pnl_method": "net_cash",
     }
 
-    print()
-    print("=" * 70)
-    print("WALLET")
-    print(wallet)
-    print("=" * 70)
-
     response = requests.get(
         URL,
         headers=HEADERS,
@@ -72,55 +66,41 @@ def analyze_wallet(wallet):
         timeout=30,
     )
 
-    print("HTTP:", response.status_code)
-
     if response.status_code != 200:
 
-        print("ERROR:")
-        print(response.text)
-
-        return None
+        return {
+            "wallet": wallet,
+            "http": response.status_code,
+            "error": response.text[:300],
+        }
 
     data = response.json()
 
-    total_trade = get_value(data, "total_trade")
-    total_win = get_value(data, "total_win")
-    total_loss = get_value(data, "total_loss")
-    win_rate = get_value(data, "win_rate")
-
-    realized = get_value(data, "realized_profit_usd")
-    unrealized = get_value(data, "unrealized_usd")
-    total_pnl = get_value(data, "total_usd")
-
-    print()
-    print("------ WALLET PERFORMANCE ------")
-
-    print("Total Trade :", total_trade)
-    print("Win         :", total_win)
-    print("Loss        :", total_loss)
-    print("Win Rate    :", win_rate)
-
-    print("Realized PnL:", realized)
-    print("Unrealized   :", unrealized)
-    print("Total PnL    :", total_pnl)
-
-    return {
+    result = {
         "wallet": wallet,
-        "total_trade": total_trade,
-        "total_win": total_win,
-        "total_loss": total_loss,
-        "win_rate": win_rate,
-        "realized_pnl": realized,
-        "unrealized_pnl": unrealized,
-        "total_pnl": total_pnl,
+        "http": 200,
+        "total_trade": get_value(data, "total_trade"),
+        "total_win": get_value(data, "total_win"),
+        "total_loss": get_value(data, "total_loss"),
+        "win_rate": get_value(data, "win_rate"),
+        "realized_pnl": get_value(
+            data,
+            "realized_profit_usd"
+        ),
+        "unrealized_pnl": get_value(
+            data,
+            "unrealized_usd"
+        ),
+        "total_pnl": get_value(
+            data,
+            "total_usd"
+        ),
     }
+
+    return result
 
 
 def main():
-
-    print("=" * 70)
-    print("SOLANA WALLET ANALYZER")
-    print("=" * 70)
 
     results = []
 
@@ -128,20 +108,20 @@ def main():
 
         result = analyze_wallet(wallet)
 
-        if result:
-            results.append(result)
+        results.append(result)
 
-        # Jangan langsung request wallet kedua
+        # Delay agar tidak kena 429
         if i < len(WALLETS) - 1:
-
-            print()
-            print("Menunggu 8 detik untuk rate limit...")
             time.sleep(8)
 
-    print()
-    print("=" * 70)
-    print("ANALISIS SELESAI")
-    print("=" * 70)
+    # SATU LOG ENTRY
+    print(
+        "WALLET_ANALYSIS="
+        + json.dumps(
+            results,
+            separators=(",", ":")
+        )
+    )
 
 
 if __name__ == "__main__":
