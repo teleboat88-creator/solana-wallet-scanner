@@ -28,11 +28,10 @@ POLL_INTERVAL = int(
 )
 
 SIGNATURE_LIMIT = 10
-
 STATE_FILE = "wallet_state.json"
 
 # ============================================================
-# 3 WALLET YANG DIPANTAU
+# WALLET
 # ============================================================
 
 WALLETS = {
@@ -47,15 +46,24 @@ WALLETS = {
 }
 
 # ============================================================
-# SOLANA RPC
+# SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "User-Agent": "SmartMoneyWalletMonitor/2.0"
 })
 
+# Cache metadata supaya token yang sama tidak
+# terus-menerus dicari ke DexScreener.
+TOKEN_CACHE = {}
+
+
+# ============================================================
+# SOLANA RPC
+# ============================================================
 
 def rpc_call(method, params):
 
@@ -100,7 +108,7 @@ def rpc_call(method, params):
 
         print(
             "RPC REQUEST ERROR:",
-            e
+            repr(e)
         )
 
         return None
@@ -144,7 +152,7 @@ def send_telegram(message):
 
             print(
                 "TELEGRAM ERROR:",
-                r.text[:300]
+                r.text[:500]
             )
 
             return False
@@ -155,7 +163,7 @@ def send_telegram(message):
 
         print(
             "TELEGRAM REQUEST ERROR:",
-            e
+            repr(e)
         )
 
         return False
@@ -202,12 +210,12 @@ def save_state(state):
 
         print(
             "STATE SAVE ERROR:",
-            e
+            repr(e)
         )
 
 
 # ============================================================
-# GET LATEST SIGNATURES
+# SIGNATURES
 # ============================================================
 
 def get_signatures(wallet):
@@ -230,7 +238,7 @@ def get_signatures(wallet):
 
 
 # ============================================================
-# GET TRANSACTION
+# TRANSACTION
 # ============================================================
 
 def get_transaction(signature):
@@ -249,12 +257,13 @@ def get_transaction(signature):
 
 
 # ============================================================
-# HELPERS
+# SOL
 # ============================================================
 
 def lamports_to_sol(value):
 
     try:
+
         return float(value) / 1_000_000_000
 
     except Exception:
@@ -284,29 +293,20 @@ def get_wallet_balance_change(
 
     try:
 
-        meta = tx.get(
-            "meta"
-        )
+        meta = tx.get("meta")
 
         if not meta:
             return 0.0
 
-        keys = get_account_keys(
-            tx
-        )
+        keys = get_account_keys(tx)
 
         wallet_index = None
 
         for i, item in enumerate(keys):
 
-            if isinstance(
-                item,
-                dict
-            ):
+            if isinstance(item, dict):
 
-                pubkey = item.get(
-                    "pubkey"
-                )
+                pubkey = item.get("pubkey")
 
             else:
 
@@ -341,9 +341,7 @@ def get_wallet_balance_change(
             - pre[wallet_index]
         )
 
-        return lamports_to_sol(
-            change
-        )
+        return lamports_to_sol(change)
 
     except Exception:
 
@@ -363,9 +361,7 @@ def token_changes(
 
     try:
 
-        meta = tx.get(
-            "meta"
-        )
+        meta = tx.get("meta")
 
         if not meta:
             return changes
@@ -380,80 +376,67 @@ def token_changes(
             []
         )
 
+        before = {}
+        after = {}
+
         # ----------------------------------------------------
         # PRE
         # ----------------------------------------------------
 
-        before = {}
-
         for item in pre:
 
-            owner = item.get(
-                "owner"
-            )
+            owner = item.get("owner")
 
             if owner != wallet:
                 continue
 
-            mint = item.get(
-                "mint"
+            mint = item.get("mint")
+
+            amount_data = item.get(
+                "uiTokenAmount",
+                {}
             )
 
-            amount = (
-                item.get(
-                    "uiTokenAmount",
-                    {}
-                )
-                .get(
+            amount = float(
+                amount_data.get(
                     "uiAmount",
                     0
-                )
+                ) or 0
             )
 
             before[mint] = (
-                before.get(
-                    mint,
-                    0
-                )
-                + float(amount or 0)
+                before.get(mint, 0)
+                + amount
             )
 
         # ----------------------------------------------------
         # POST
         # ----------------------------------------------------
 
-        after = {}
-
         for item in post:
 
-            owner = item.get(
-                "owner"
-            )
+            owner = item.get("owner")
 
             if owner != wallet:
                 continue
 
-            mint = item.get(
-                "mint"
+            mint = item.get("mint")
+
+            amount_data = item.get(
+                "uiTokenAmount",
+                {}
             )
 
-            amount = (
-                item.get(
-                    "uiTokenAmount",
-                    {}
-                )
-                .get(
+            amount = float(
+                amount_data.get(
                     "uiAmount",
                     0
-                )
+                ) or 0
             )
 
             after[mint] = (
-                after.get(
-                    mint,
-                    0
-                )
-                + float(amount or 0)
+                after.get(mint, 0)
+                + amount
             )
 
         # ----------------------------------------------------
@@ -493,10 +476,134 @@ def token_changes(
 
         print(
             "TOKEN PARSE ERROR:",
-            e
+            repr(e)
         )
 
     return changes
+
+
+# ============================================================
+# TOKEN METADATA
+# ============================================================
+
+def get_token_metadata(mint):
+
+    if mint in TOKEN_CACHE:
+
+        return TOKEN_CACHE[mint]
+
+    default = {
+        "symbol": "UNKNOWN",
+        "name": "Unknown Token"
+    }
+
+    # --------------------------------------------------------
+    # DexScreener
+    # --------------------------------------------------------
+
+    url = (
+        "https://api.dexscreener.com/latest/dex/tokens/"
+        + mint
+    )
+
+    try:
+
+        r = session.get(
+            url,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+
+            print(
+                f"DEXSCREENER ERROR "
+                f"{r.status_code}: "
+                f"{r.text[:200]}"
+            )
+
+            TOKEN_CACHE[mint] = default
+
+            return default
+
+        data = r.json()
+
+        pairs = data.get(
+            "pairs",
+            []
+        )
+
+        if not pairs:
+
+            TOKEN_CACHE[mint] = default
+
+            return default
+
+        # Ambil pair Solana pertama
+        # yang mempunyai baseToken/quoteToken.
+        selected = None
+
+        for pair in pairs:
+
+            if pair.get("chainId") == "solana":
+
+                selected = pair
+                break
+
+        if selected is None:
+
+            selected = pairs[0]
+
+        base = selected.get(
+            "baseToken",
+            {}
+        )
+
+        quote = selected.get(
+            "quoteToken",
+            {}
+        )
+
+        symbol = base.get(
+            "symbol"
+        )
+
+        name = base.get(
+            "name"
+        )
+
+        # Kadang token yang dicari berada
+        # sebagai quoteToken.
+        if not symbol and quote:
+
+            symbol = quote.get(
+                "symbol"
+            )
+
+        if not name and quote:
+
+            name = quote.get(
+                "name"
+            )
+
+        result = {
+            "symbol": symbol or "UNKNOWN",
+            "name": name or "Unknown Token"
+        }
+
+        TOKEN_CACHE[mint] = result
+
+        return result
+
+    except Exception as e:
+
+        print(
+            "TOKEN METADATA ERROR:",
+            repr(e)
+        )
+
+        TOKEN_CACHE[mint] = default
+
+        return default
 
 
 # ============================================================
@@ -511,10 +618,12 @@ def analyze_transaction(
     if not tx:
         return None
 
-    if tx.get(
+    meta = tx.get(
         "meta",
         {}
-    ).get("err") is not None:
+    )
+
+    if meta.get("err") is not None:
 
         return None
 
@@ -541,12 +650,9 @@ def analyze_transaction(
         if x["change"] < 0
     ]
 
-    # --------------------------------------------------------
+    # ========================================================
     # BUY
-    #
-    # Wallet kehilangan SOL
-    # dan mendapatkan token.
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         sol_change < -0.00001
@@ -565,12 +671,9 @@ def analyze_transaction(
             "sol_change": sol_change
         }
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELL
-    #
-    # Wallet mendapatkan SOL
-    # dan kehilangan token.
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         sol_change > 0.00001
@@ -593,7 +696,7 @@ def analyze_transaction(
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# BUILD TELEGRAM
 # ============================================================
 
 def build_message(
@@ -605,6 +708,26 @@ def build_message(
 
     side = analysis["side"]
 
+    mint = analysis["mint"]
+
+    amount = analysis["amount"]
+
+    sol_change = analysis[
+        "sol_change"
+    ]
+
+    metadata = get_token_metadata(
+        mint
+    )
+
+    symbol = metadata[
+        "symbol"
+    ]
+
+    name = metadata[
+        "name"
+    ]
+
     if side == "BUY":
 
         emoji = "🟢"
@@ -615,29 +738,32 @@ def build_message(
         emoji = "🔴"
         title = "WALLET SELL"
 
-    mint = analysis["mint"]
+    if sol_change < 0:
 
-    amount = analysis["amount"]
+        sol_text = (
+            f"-{abs(sol_change):,.6f} SOL"
+        )
 
-    sol_change = analysis[
-        "sol_change"
-    ]
+    else:
+
+        sol_text = (
+            f"+{abs(sol_change):,.6f} SOL"
+        )
 
     message = (
         f"{emoji} {title}\n"
-        "\n"
+        f"\n"
         f"👛 Wallet: {wallet_name}\n"
         f"📍 {wallet}\n"
-        "\n"
-        f"🪙 Token Mint:\n"
-        f"{mint}\n"
-        "\n"
-        f"🔢 Token Amount: "
-        f"{amount:,.8f}\n"
-        f"◎ SOL Change: "
-        f"{sol_change:+.6f} SOL\n"
-        "\n"
-        f"🔗 Transaction:\n"
+        f"\n"
+        f"🪙 Coin: {name}\n"
+        f"📛 Ticker: {symbol}\n"
+        f"🔑 Mint:\n{mint}\n"
+        f"\n"
+        f"🔢 Amount: {amount:,.8f}\n"
+        f"◎ SOL: {sol_text}\n"
+        f"\n"
+        f"🔗 TX:\n"
         f"https://solscan.io/tx/{signature}"
     )
 
@@ -645,7 +771,7 @@ def build_message(
 
 
 # ============================================================
-# INITIALIZE
+# INITIAL SNAPSHOT
 # ============================================================
 
 def initialize_state():
@@ -663,9 +789,12 @@ def initialize_state():
         if not signatures:
             continue
 
-        latest = signatures[0][
+        latest = signatures[0].get(
             "signature"
-        ]
+        )
+
+        if not latest:
+            continue
 
         if name not in state:
 
@@ -679,9 +808,7 @@ def initialize_state():
 
     if changed:
 
-        save_state(
-            state
-        )
+        save_state(state)
 
     return state
 
@@ -719,18 +846,18 @@ def check_wallet(
             continue
 
         if signature == last_signature:
+
             break
 
         new_transactions.append(
             signature
         )
 
-    # Tidak ada transaksi baru
     if not new_transactions:
         return
 
     # --------------------------------------------------------
-    # Process oldest -> newest
+    # Lama -> baru
     # --------------------------------------------------------
 
     for signature in reversed(
@@ -755,6 +882,12 @@ def check_wallet(
         )
 
         if not analysis:
+
+            print(
+                f"{name}: transaction "
+                f"bukan BUY/SELL"
+            )
+
             continue
 
         message = build_message(
@@ -765,7 +898,7 @@ def check_wallet(
         )
 
         print(
-            f"{analysis['side']} detected: "
+            f"{analysis['side']} detected | "
             f"{analysis['mint']}"
         )
 
@@ -773,18 +906,17 @@ def check_wallet(
             message
         )
 
-        # Sedikit jeda supaya
-        # tidak spam Telegram
         time.sleep(1)
 
-    # Simpan transaksi terbaru
-    state[name] = signatures[0][
-        "signature"
-    ]
+    # --------------------------------------------------------
+    # Update state
+    # --------------------------------------------------------
 
-    save_state(
-        state
+    state[name] = signatures[0].get(
+        "signature"
     )
+
+    save_state(state)
 
 
 # ============================================================
@@ -794,34 +926,22 @@ def check_wallet(
 def main():
 
     print(
-        "SMART MONEY WALLET MONITOR"
+        "SMART MONEY WALLET MONITOR V2"
     )
 
     print(
-        "Wallets:",
-        len(WALLETS)
+        f"Monitoring {len(WALLETS)} wallets"
     )
 
     print(
-        "RPC:",
-        RPC_URL
+        f"RPC: {RPC_URL}"
     )
-
-    # --------------------------------------------------------
-    # INITIAL SNAPSHOT
-    #
-    # Transaksi lama TIDAK dikirim Telegram.
-    # --------------------------------------------------------
 
     state = initialize_state()
 
     print(
         "Monitoring started."
     )
-
-    # --------------------------------------------------------
-    # LOOP
-    # --------------------------------------------------------
 
     while True:
 
@@ -842,7 +962,6 @@ def main():
                     repr(e)
                 )
 
-            # Jeda antar-wallet
             time.sleep(1)
 
         time.sleep(
@@ -851,7 +970,7 @@ def main():
 
 
 # ============================================================
-# RUN
+# START
 # ============================================================
 
 if __name__ == "__main__":
